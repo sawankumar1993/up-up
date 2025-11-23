@@ -1,419 +1,1033 @@
+import io
 import re
-from datetime import timedelta
+from datetime import datetime, date, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from catboost import CatBoostClassifier
 
-st.set_page_config(
-    page_title="0–99 ML + Monthly Probability (CatBoost)",
-    layout="wide",
-)
+try:
+    from catboost import CatBoostClassifier
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
 
-st.title("0–99 ML + Monthly Probability Blending (Monthly-only mode)")
-st.caption(
-    "Step 1: Monthly-only probability strategy blended with a CatBoost model. "
-    "Upload your lottery CSV (Year, Month, Day, DR, FB, GZ/GB, GL) to begin."
-)
+# -------------------- Constants -------------------- #
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def find_col(df: pd.DataFrame, candidates):
-    cand_lower = [c.lower() for c in candidates]
-    for col in df.columns:
-        if str(col).strip().lower() in cand_lower:
-            return col
-    return None
+DOWS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
 
-def parse_numbers(cell):
-    if pd.isna(cell):
-        return []
-    return [int(x) for x in re.findall(r"\d{1,3}", str(cell))]
+# -------------------- CSV + base parsing -------------------- #
+
+def detect_delimiter(first_line: str) -> str:
+    if "\t" in first_line:
+        return "\t"
+    counts = {
+        ";": first_line.count(";"),
+        ",": first_line.count(","),
+        "|": first_line.count("|"),
+    }
+    return max(counts, key=counts.get) or ","
 
 
-@st.cache_data(show_spinner=False)
-def load_csv(file) -> pd.DataFrame:
-    # pandas can sniff delimiter if sep=None, engine="python"
-    df = pd.read_csv(file, sep=None, engine="python")
-    return df
-
-
-def prepare_base_df(df_raw: pd.DataFrame):
-    # Find key columns (case-insensitive, supports Month/MM, Day/DD/DOM, GZ or GB)
-    year_col = find_col(df_raw, ["year"])
-    month_col = find_col(df_raw, ["month", "mm"])
-    day_col = find_col(df_raw, ["day", "dd", "dom"])
-    dr_col = find_col(df_raw, ["dr"])
-    fb_col = find_col(df_raw, ["fb"])
-    gz_col = find_col(df_raw, ["gz", "gb"])
-    gl_col = find_col(df_raw, ["gl"])
-
-    missing = [name for name, col in [
-        ("Year", year_col),
-        ("Month", month_col),
-        ("Day", day_col),
-        ("DR", dr_col),
-        ("FB", fb_col),
-        ("GZ/GB", gz_col),
-        ("GL", gl_col),
-    ] if col is None]
-
-    if missing:
-        raise ValueError(f"Missing expected columns: {', '.join(missing)}")
-
-    # Build normalized date column
-    df = df_raw.copy()
-    df["__year"] = df[year_col].astype(int)
-    df["__month"] = df[month_col].astype(int)
-    df["__day"] = df[day_col].astype(int)
-
-    df["date"] = pd.to_datetime(
-        dict(year=df["__year"], month=df["__month"], day=df["__day"]),
-        errors="coerce",
-    )
-    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-    # Parsed numbers per lottery column
-    df["DR_nums"] = df[dr_col].apply(parse_numbers)
-    df["FB_nums"] = df[fb_col].apply(parse_numbers)
-    df["GZGB_nums"] = df[gz_col].apply(parse_numbers)
-    df["GL_nums"] = df[gl_col].apply(parse_numbers)
-
-    return df
-
-
-def build_number_day_dataset(df: pd.DataFrame, nums_max: int, which: str) -> pd.DataFrame:
-    """
-    Expand each date into rows for numbers 0..nums_max, with y=1 if that number
-    appears in the chosen lottery column.
-    which: one of "DR_nums", "FB_nums", "GZGB_nums", "GL_nums"
-    """
-    rows = []
-    for _, row in df.iterrows():
-        d = row["date"]
-        month = d.month
-        dow = d.weekday()  # Monday=0
-        dom = d.day
-        drawn_set = set(row[which])
-        for n in range(nums_max + 1):
-            rows.append(
-                {
-                    "date": d,
-                    "month": month,
-                    "dow": dow,
-                    "dom": dom,
-                    "num": n,
-                    "y": 1 if n in drawn_set else 0,
-                }
-            )
-    out = pd.DataFrame(rows)
+def numbers_from_cell(cell):
+    s = "" if cell is None else str(cell)
+    tokens = re.findall(r"\d{1,3}", s)
+    out = []
+    for t in tokens:
+        try:
+            n = int(t)
+            out.append(n)
+        except ValueError:
+            pass
     return out
 
 
-def chronological_split(df_events: pd.DataFrame, train_frac: float = 0.8):
-    """Time-based split by unique dates (leak-free)."""
-    unique_dates = np.sort(df_events["date"].unique())
-    if len(unique_dates) < 5:
-        # too small, just use everything for train & valid
-        idx = df_events.index
-        return idx, idx, unique_dates[-1]
-
-    split_idx = int(len(unique_dates) * train_frac)
-    split_date = unique_dates[split_idx]
-
-    train_idx = df_events.index[df_events["date"] < split_date]
-    valid_idx = df_events.index[df_events["date"] >= split_date]
-    # if split degenerates, ensure non-empty valid
-    if len(valid_idx) == 0:
-        valid_idx = train_idx
-    return train_idx, valid_idx, split_date
+def month_index_full(name: str):
+    if name is None:
+        return None
+    m = str(name).strip().lower()
+    months = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+    if m in months:
+        return months[m]
+    pref = m[:3]
+    for full, idx in months.items():
+        if full.startswith(pref):
+            return idx
+    return None
 
 
-@st.cache_resource(show_spinner=True)
-def train_catboost_model(df_events: pd.DataFrame):
-    """
-    Train a CatBoost classifier on (month, dow, dom, num) -> y.
-    Uses a chronological split to avoid leakage.
-    """
-    train_idx, valid_idx, split_date = chronological_split(df_events)
-    features = ["month", "dow", "dom", "num"]
+def load_csv_to_map(uploaded_file):
+    raw_bytes = uploaded_file.getvalue()
+    decoded = raw_bytes.decode("utf-8", errors="replace")
+    lines = decoded.splitlines()
+    if not lines:
+        return {}, 0, True
 
-    X_train = df_events.loc[train_idx, features]
-    y_train = df_events.loc[train_idx, "y"]
-    X_valid = df_events.loc[valid_idx, features]
-    y_valid = df_events.loc[valid_idx, "y"]
+    delim = detect_delimiter(lines[0])
+    df = pd.read_csv(io.StringIO(decoded), delimiter=delim)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    col_year = "year" if "year" in df.columns else None
+    col_month = None
+    for cand in ["month", "mm"]:
+        if cand in df.columns:
+            col_month = cand
+            break
+    col_day = None
+    for cand in ["day", "dd", "dom"]:
+        if cand in df.columns:
+            col_day = cand
+            break
+
+    if col_year is None or col_month is None or col_day is None:
+        raise ValueError(
+            "CSV must contain headers for year, month/mm and day/dd/dom (case-insensitive)."
+        )
+
+    col_dr = "dr" if "dr" in df.columns else None
+    col_fb = "fb" if "fb" in df.columns else None
+    col_gz = None
+    has_gz = False
+    if "gz" in df.columns:
+        col_gz = "gz"
+        has_gz = True
+    elif "gb" in df.columns:
+        col_gz = "gb"
+        has_gz = False
+    col_gl = "gl" if "gl" in df.columns else None
+
+    date_map = {}
+    seen_keys = set()
+
+    for _, row in df.iterrows():
+        y_raw = str(row[col_year]).strip()
+        m_raw = str(row[col_month]).strip()
+        d_raw = str(row[col_day]).strip()
+        if not y_raw or not d_raw:
+            continue
+        try:
+            y = int(float(y_raw))
+            d = int(float(d_raw))
+        except ValueError:
+            continue
+        if y <= 0 or d <= 0:
+            continue
+
+        if m_raw.isdigit():
+            m = int(float(m_raw))
+        else:
+            m = month_index_full(m_raw)
+        if not m or m < 1 or m > 12:
+            continue
+
+        key = f"{y:04d}-{m:02d}-{d:02d}"
+        entry = date_map.get(key, {"DR": [], "FB": [], "GZGB": [], "GL": []})
+
+        if col_dr is not None:
+            entry["DR"].extend(numbers_from_cell(row[col_dr]))
+        if col_fb is not None:
+            entry["FB"].extend(numbers_from_cell(row[col_fb]))
+        if col_gz is not None:
+            entry["GZGB"].extend(numbers_from_cell(row[col_gz]))
+        if col_gl is not None:
+            entry["GL"].extend(numbers_from_cell(row[col_gl]))
+
+        date_map[key] = entry
+        seen_keys.add(key)
+
+    return date_map, len(seen_keys), has_gz
+
+
+def parse_custom_nums(text: str):
+    if not text:
+        return set()
+    tokens = re.findall(r"\d{1,3}", text)
+    out = set()
+    for t in tokens:
+        try:
+            n = int(t)
+            if 0 <= n <= 99:
+                out.add(n)
+        except ValueError:
+            continue
+    return out
+
+
+def in_range_or_custom(n, rmin, rmax, custom_set, custom_only, use_custom) -> bool:
+    if custom_only and use_custom:
+        return n in custom_set
+    if use_custom and custom_set and not custom_only:
+        return (rmin <= n <= rmax) or (n in custom_set)
+    return rmin <= n <= rmax
+
+
+def build_rows_df(date_map, rmin, rmax, custom_set, custom_only):
+    keys = sorted(date_map.keys())
+    rows = []
+    use_custom = bool(custom_set)
+
+    for key in keys:
+        entry = date_map.get(key, {"DR": [], "FB": [], "GZGB": [], "GL": []})
+        dr_list = entry.get("DR", []) or []
+        fb_list = entry.get("FB", []) or []
+        gz_list = entry.get("GZGB", []) or []
+        gl_list = entry.get("GL", []) or []
+
+        def check_arr(arr):
+            for n in arr:
+                if in_range_or_custom(n, rmin, rmax, custom_set, custom_only, use_custom):
+                    return True
+            return False
+
+        dr_win = check_arr(dr_list)
+        fb_win = check_arr(fb_list)
+        gz_win = check_arr(gz_list)
+        gl_win = check_arr(gl_list)
+        any_win = dr_win or fb_win or gz_win or gl_win
+
+        y, m, d = [int(x) for x in key.split("-")]
+        dt = datetime(y, m, d)
+
+        # JS-style DOW index: 0=Sun, 6=Sat
+        dow_js_idx = (dt.weekday() + 1) % 7  # Python weekday: 0=Mon
+        dow_label = DOWS[dow_js_idx]
+
+        rows.append(
+            {
+                "date_key": key,
+                "date": dt,
+                "dow_label": dow_label,
+                "dow_js_idx": dow_js_idx,
+                "DR": dr_list,
+                "FB": fb_list,
+                "GZGB": gz_list,
+                "GL": gl_list,
+                "DR_win": dr_win,
+                "FB_win": fb_win,
+                "GZGB_win": gz_win,
+                "GL_win": gl_win,
+                "any_win": any_win,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["date"]).astype("int64") // 10**9
+    return df
+
+
+def format_nums(arr):
+    if not isinstance(arr, (list, tuple)):
+        return ""
+    return " ".join(str(int(x)) for x in sorted(arr))
+
+
+def summarize_wins(df: pd.DataFrame):
+    total_days = len(df)
+    return {
+        "total_days": total_days,
+        "DR": int(df["DR_win"].sum()),
+        "FB": int(df["FB_win"].sum()),
+        "GZGB": int(df["GZGB_win"].sum()),
+        "GL": int(df["GL_win"].sum()),
+        "ANY": int(df["any_win"].sum()),
+    }
+
+
+# -------------------- Probability engine (per-day range) -------------------- #
+
+def analyze_prob(df: pd.DataFrame, mode: str = "dow", alpha: float = 2.0,
+                 lam: float = 0.01, advanced: bool = True):
+    if df.empty:
+        return None
+
+    now_ts = df["timestamp"].max()
+
+    if mode == "dow":
+        buckets = DOWS
+        bucket_series = df["dow_label"]
+    else:
+        buckets = [str(i) for i in range(1, 32)]
+        bucket_series = df["date"].dt.day.astype(str)
+
+    K = len(buckets)
+    counts = {b: 0 for b in buckets}
+    totals = {b: 0 for b in buckets}
+    weighted_hits = {b: 0.0 for b in buckets}
+    weighted_totals = {b: 0.0 for b in buckets}
+
+    for i, row in df.iterrows():
+        label = bucket_series.iloc[i]
+        if label not in totals:
+            continue
+        totals[label] += 1
+        is_hit = bool(row["any_win"])
+        if is_hit:
+            counts[label] += 1
+
+        age_days = max(0.0, (now_ts - row["timestamp"]) / 86400.0)
+        w = float(np.exp(-lam * age_days))
+        weighted_totals[label] += w
+        if is_hit:
+            weighted_hits[label] += w
+
+    results = []
+    for b in buckets:
+        hit = counts[b]
+        tot = totals[b]
+        basic = (hit / tot) if tot > 0 else 0.0
+        smoothed = (hit + alpha) / (tot + alpha * K) if (tot + alpha * K) > 0 else 0.0
+        weighted = (weighted_hits[b] / weighted_totals[b]) if weighted_totals[b] > 0 else 0.0
+        final = (0.6 * weighted + 0.3 * smoothed + 0.1 * basic) if advanced else basic
+        results.append(
+            {
+                "bucket": b,
+                "hit": hit,
+                "total": tot,
+                "basic": basic,
+                "smoothed": smoothed,
+                "weighted": weighted,
+                "final": final,
+            }
+        )
+
+    if mode == "dom":
+        results.sort(key=lambda r: int(r["bucket"]))
+
+    return {"results": results}
+
+
+# -------------------- ML — per-date range model (Any WIN) -------------------- #
+
+def make_ml_features_range(df: pd.DataFrame, rmin: int, rmax: int, custom_set: set):
+    feats = pd.DataFrame()
+    feats["dow_js_idx"] = df["dow_js_idx"]
+    feats["dom"] = df["date"].dt.day
+    feats["month"] = df["date"].dt.month
+    feats["year"] = df["date"].dt.year
+    feats["range_span"] = rmax - rmin
+    feats["num_custom"] = len(custom_set)
+    feats["len_DR"] = df["DR"].apply(lambda xs: len(xs) if isinstance(xs, list) else 0)
+    feats["len_FB"] = df["FB"].apply(lambda xs: len(xs) if isinstance(xs, list) else 0)
+    feats["len_GZGB"] = df["GZGB"].apply(lambda xs: len(xs) if isinstance(xs, list) else 0)
+    feats["len_GL"] = df["GL"].apply(lambda xs: len(xs) if isinstance(xs, list) else 0)
+    return feats
+
+
+def chrono_split_dates(df_features, y, train_ratio=0.8):
+    sort_idx = np.argsort(df_features.index.values)
+    X_sorted = df_features.iloc[sort_idx].reset_index(drop=True)
+    y_sorted = y.iloc[sort_idx].reset_index(drop=True)
+
+    n = len(X_sorted)
+    n_train = max(1, int(n * train_ratio))
+    if n_train >= n:
+        n_train = n - 1
+    X_train = X_sorted.iloc[:n_train]
+    y_train = y_sorted.iloc[:n_train]
+    X_test = X_sorted.iloc[n_train:]
+    y_test = y_sorted.iloc[n_train:]
+    return X_train, X_test, y_train, y_test
+
+
+def train_catboost_range(df: pd.DataFrame, rmin: int, rmax: int, custom_set: set, train_ratio: float = 0.8):
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+
+    feats = make_ml_features_range(df, rmin, rmax, custom_set)
+    y = df["any_win"].astype(int)
+    X_train, X_test, y_train, y_test = chrono_split_dates(feats, y, train_ratio=train_ratio)
 
     model = CatBoostClassifier(
-        loss_function="Logloss",
         depth=6,
         learning_rate=0.1,
-        iterations=300,
+        iterations=400,
+        loss_function="Logloss",
+        eval_metric="AUC",
         random_seed=42,
         verbose=False,
     )
-    model.fit(X_train, y_train, eval_set=(X_valid, y_valid), use_best_model=True)
+    model.fit(X_train, y_train, eval_set=(X_test, y_test), verbose=False)
 
-    # Simple validation metric
-    valid_probs = model.predict_proba(X_valid)[:, 1]
-    valid_pred = (valid_probs >= 0.5).astype(int)
-    acc = (valid_pred == y_valid.values).mean()
+    proba_test = model.predict_proba(X_test)[:, 1]
+    preds_test = (proba_test >= 0.5).astype(int)
 
-    return model, split_date, float(acc)
+    metrics = {
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "accuracy": float(accuracy_score(y_test, preds_test)) if len(X_test) > 0 else float("nan"),
+        "precision": float(precision_score(y_test, preds_test, zero_division=0)) if len(X_test) > 0 else float("nan"),
+        "recall": float(recall_score(y_test, preds_test, zero_division=0)) if len(X_test) > 0 else float("nan"),
+    }
+    try:
+        metrics["auc"] = float(roc_auc_score(y_test, proba_test)) if len(X_test) > 0 else float("nan")
+    except ValueError:
+        metrics["auc"] = float("nan")
+
+    return model, metrics
 
 
-def compute_monthly_probs(
-    df_base: pd.DataFrame,
-    lottery_col: str,
-    split_date,
-    max_num: int,
-    alpha: float,
+def make_single_features_for_date_range(target_date: date, rmin: int, rmax: int, custom_set: set):
+    dt = datetime(target_date.year, target_date.month, target_date.day)
+    df_tmp = pd.DataFrame({"date": [dt]})
+    dow_js_idx = (dt.weekday() + 1) % 7
+    df_tmp["dow_js_idx"] = [dow_js_idx]
+    df_tmp["DR"] = [[]]
+    df_tmp["FB"] = [[]]
+    df_tmp["GZGB"] = [[]]
+    df_tmp["GL"] = [[]]
+    feats = make_ml_features_range(df_tmp, rmin, rmax, custom_set)
+    return feats
+
+
+# -------------------- ML Ensemble 0–99 (CatBoost replacement) -------------------- #
+
+def ens_build_dataset(df: pd.DataFrame, lottery_key: str):
+    xs = []
+    ys = []
+    df_sorted = df.sort_values("date")
+    for _, row in df_sorted.iterrows():
+        key = row["date_key"]
+        parts = str(key).split("-")
+        if len(parts) != 3:
+            continue
+        try:
+            dd = int(parts[2])
+        except ValueError:
+            continue
+        dow_idx = int(row["dow_js_idx"])
+        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+        num_set = set(int(n) for n in nums_arr if 0 <= int(n) <= 99)
+
+        x_base1 = dow_idx / 6.0
+        x_base2 = dd / 31.0
+        for num in range(100):
+            x3 = num / 99.0
+            y = 1 if num in num_set else 0
+            xs.append([x_base1, x_base2, x3])
+            ys.append(y)
+
+    if not xs:
+        return None, None
+    X = np.array(xs, dtype=np.float32)
+    y = np.array(ys, dtype=np.int32)
+    return X, y
+
+
+def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 0.8):
+    from sklearn.metrics import accuracy_score, roc_auc_score
+
+    X, y = ens_build_dataset(df, lottery_key)
+    if X is None:
+        raise ValueError("No samples built for ensemble model.")
+
+    n = X.shape[0]
+    n_train = max(1, int(n * train_ratio))
+    if n_train >= n:
+        n_train = n - 1
+    X_train = X[:n_train]
+    y_train = y[:n_train]
+    X_val = X[n_train:]
+    y_val = y[n_train:]
+
+    model = CatBoostClassifier(
+        depth=6,
+        learning_rate=0.08,
+        iterations=400,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        random_seed=42,
+        verbose=False,
+    )
+    model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
+
+    if len(X_val) > 0:
+        proba_val = model.predict_proba(X_val)[:, 1]
+        preds_val = (proba_val >= 0.5).astype(int)
+        val_acc = float(accuracy_score(y_val, preds_val))
+        try:
+            val_auc = float(roc_auc_score(y_val, proba_val))
+        except ValueError:
+            val_auc = float("nan")
+    else:
+        val_acc = float("nan")
+        val_auc = float("nan")
+
+    metrics = {
+        "samples": int(n),
+        "n_train": int(n_train),
+        "n_val": int(n - n_train),
+        "val_accuracy": val_acc,
+        "val_auc": val_auc,
+    }
+    return model, metrics
+
+
+def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: bool):
+    now_ts = int(datetime.utcnow().timestamp() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+    lam = 0.02
+
+    hits_num_dow = np.zeros((100, 7), dtype=float)
+    hits_num_dom = np.zeros((100, 32), dtype=float)
+    tot_dow = np.zeros(7, dtype=float)
+    tot_dom = np.zeros(32, dtype=float)
+
+    df_sorted = df.sort_values("date")
+    for _, row in df_sorted.iterrows():
+        key = row["date_key"]
+        parts = str(key).split("-")
+        if len(parts) != 3:
+            continue
+        try:
+            dd = int(parts[2])
+        except ValueError:
+            continue
+        if dd < 1 or dd > 31:
+            continue
+
+        try:
+            dow_index = DOWS.index(row["dow_label"])
+        except ValueError:
+            continue
+
+        ts = int(row["timestamp"] * 1000)
+        age_days = max(0.0, (now_ts - ts) / day_ms)
+        w = float(np.exp(-lam * age_days)) if recency_mode else 1.0
+
+        tot_dow[dow_index] += w
+        tot_dom[dd] += w
+
+        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+        for raw in nums_arr:
+            try:
+                num = int(raw)
+            except ValueError:
+                continue
+            if 0 <= num <= 99:
+                hits_num_dow[num, dow_index] += w
+                hits_num_dom[num, dd] += w
+
+    weekly_profile = np.zeros((100, 7), dtype=float)
+    monthly_profile = np.zeros((100, 32), dtype=float)
+    max_weekly = 0.0
+    max_monthly = 0.0
+
+    for num in range(100):
+        for d in range(7):
+            tot = tot_dow[d]
+            if tot > 0:
+                p = hits_num_dow[num, d] / tot
+                weekly_profile[num, d] = p
+                if p > max_weekly:
+                    max_weekly = p
+        for dom in range(1, 32):
+            tot = tot_dom[dom]
+            if tot > 0:
+                p = hits_num_dom[num, dom] / tot
+                monthly_profile[num, dom] = p
+                if p > max_monthly:
+                    max_monthly = p
+
+    return {
+        "weekly_profile": weekly_profile,
+        "monthly_profile": monthly_profile,
+        "max_weekly": max_weekly,
+        "max_monthly": max_monthly,
+    }
+
+
+def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
+    hit_dates = [[] for _ in range(100)]
+    df_sorted = df.sort_values("date")
+    for _, row in df_sorted.iterrows():
+        ts = int(row["timestamp"] * 1000)
+        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+        for raw in nums_arr:
+            try:
+                num = int(raw)
+            except ValueError:
+                continue
+            if 0 <= num <= 99:
+                hit_dates[num].append(ts)
+    return hit_dates
+
+
+def ens_score_numbers_for_date(
+    model,
+    df: pd.DataFrame,
+    lottery_key: str,
+    prob_mode: str,
+    prob_weight_coeff: float,
+    prediction_date: date,
 ):
+    if df.empty:
+        raise ValueError("No data loaded.")
+
+    # Build probability profiles
+    use_recency_profiles = (prob_mode == "recent")
+    profiles = ens_build_number_profiles(df, lottery_key, recency_mode=use_recency_profiles)
+    weekly_profile = profiles["weekly_profile"]
+    monthly_profile = profiles["monthly_profile"]
+    max_weekly = profiles["max_weekly"]
+    max_monthly = profiles["max_monthly"]
+
+    # Recency hit dates (for 'recent' mode)
+    hit_dates = ens_build_hit_dates(df, lottery_key)
+
+    # ML scores for this date
+    dt = datetime(prediction_date.year, prediction_date.month, prediction_date.day)
+    dow_index = (dt.weekday() + 1) % 7  # JS-style 0..6, Sun=0
+    dd = dt.day
+
+    x1 = dow_index / 6.0
+    x2 = dd / 31.0
+    feats = []
+    for num in range(100):
+        x3 = num / 99.0
+        feats.append([x1, x2, x3])
+    X_pred = np.array(feats, dtype=np.float32)
+    ml_probs = model.predict_proba(X_pred)[:, 1]
+
+    day_ms = 24 * 60 * 60 * 1000
+    today_ts = int(dt.timestamp() * 1000)
+    window_days = 90.0
+
+    scored = []
+    for num in range(100):
+        ml_score = float(ml_probs[num])
+
+        w_week = 0.0
+        w_month = 0.0
+        norm_week = 0.0
+        norm_month = 0.0
+
+        if max_weekly > 0.0:
+            w_week = weekly_profile[num, dow_index]
+            norm_week = w_week / max_weekly
+        if max_monthly > 0.0 and 1 <= dd <= 31:
+            w_month = monthly_profile[num, dd]
+            norm_month = w_month / max_monthly
+
+        if prob_mode == "weekly":
+            w_num = norm_week
+        elif prob_mode == "monthly":
+            w_num = norm_month
+        elif prob_mode == "both":
+            vals = []
+            if norm_week > 0:
+                vals.append(norm_week)
+            if norm_month > 0:
+                vals.append(norm_month)
+            w_num = sum(vals) / len(vals) if vals else 0.0
+        elif prob_mode == "recent":
+            hits = hit_dates[num]
+            rec_score = 0.0
+            if hits:
+                last_ts = hits[-1]
+                if last_ts <= today_ts:
+                    rec_days = (today_ts - last_ts) / day_ms
+                    rec_score = 1.0 / (1.0 + rec_days)
+
+            count = 0
+            for ts in reversed(hits):
+                age_days = (today_ts - ts) / day_ms
+                if age_days < 0:
+                    continue
+                if age_days > window_days:
+                    break
+                count += 1
+            freq3 = count / window_days
+            w_num = rec_score + freq3
+        else:
+            w_num = 0.0
+
+        if w_num > 0:
+            final_score = ml_score * (1.0 - prob_weight_coeff) + w_num * prob_weight_coeff
+        else:
+            final_score = ml_score
+
+        scored.append(
+            {
+                "number": num,
+                "ml_score": ml_score,
+                "prob_score": w_num,
+                "final_score": final_score,
+            }
+        )
+
+    scored_sorted = sorted(scored, key=lambda r: r["final_score"], reverse=True)
+    return scored_sorted
+
+
+# -------------------- Streamlit UI -------------------- #
+
+st.set_page_config(
+    page_title="Lottery Tools — Range Wins + ML Ensemble (CatBoost)",
+    layout="wide",
+)
+
+st.title("Lottery Tools — Range Wins + ML Ensemble (CatBoost)")
+
+st.markdown(
     """
-    Compute monthly P(number|month) using ONLY training window (date < split_date)
-    to keep it leak-free.
+    This Streamlit app mirrors your browser tools:
 
-    df_base: original per-date dataframe with *_nums lists
-    lottery_col: e.g. "DR_nums"
+    1. **Range Wins (per-date)** — classical range/custom analysis + CatBoost model for *Any WIN*.
+    2. **ML — Ensemble Number Prediction (0–99)** — CatBoost replacement for your TensorFlow ensemble,
+       including:
+       - **Probability Weight Strategy** (Weekly / Monthly / Both / Recency-weighted 3-month focus)
+       - **ML / Probability blending** slider
+       - **Core / Mid / Edge** tier sizing within Top N.
     """
-    # restrict to training dates
-    df_train = df_base[df_base["date"] < split_date].copy()
-    if df_train.empty:
-        # fallback: use all data
-        df_train = df_base.copy()
-
-    monthly_totals = np.zeros(12, dtype=int)
-    monthly_counts = np.zeros((12, max_num + 1), dtype=int)
-
-    for _, row in df_train.iterrows():
-        m = row["date"].month - 1  # 0-11
-        monthly_totals[m] += 1
-        for n in row[lottery_col]:
-            if 0 <= n <= max_num:
-                monthly_counts[m, n] += 1
-
-    def probs_for_month(month: int):
-        idx = month - 1
-        tot = monthly_totals[idx]
-        if tot == 0:
-            # If no history for that month in training, fallback to uniform
-            return np.full(max_num + 1, 1.0 / (max_num + 1))
-        return (monthly_counts[idx, :] + alpha) / (tot + alpha * (max_num + 1))
-
-    return probs_for_month, monthly_counts, monthly_totals
-
-
-# -----------------------------
-# Sidebar: data + settings
-# -----------------------------
-with st.sidebar:
-    st.header("1. Data & Settings")
-    file = st.file_uploader("Upload CSV", type=["csv", "tsv"])
-
-    max_num = st.number_input(
-        "Max number (inclusive)",
-        min_value=10,
-        max_value=999,
-        value=99,
-        step=1,
-        help="If your lottery uses 0–99, keep at 99.",
-    )
-
-    blend_weight = st.slider(
-        "ML / Probability blending (1.0 = pure Monthly probability)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.4,
-        step=0.05,
-        help="0.0 = pure CatBoost ML, 1.0 = pure monthly probability.",
-    )
-
-    alpha = st.number_input(
-        "Laplace smoothing α (monthly probs)",
-        min_value=0.0,
-        max_value=100.0,
-        value=2.0,
-        step=0.5,
-    )
-
-    top_n = st.number_input(
-        "Top N numbers",
-        min_value=1,
-        max_value=200,
-        value=20,
-        step=1,
-    )
-
-    core_n = st.number_input(
-        "Core size",
-        min_value=0,
-        max_value=200,
-        value=8,
-        step=1,
-        help="Highest confidence set. Must be ≤ Top N.",
-    )
-
-    mid_n = st.number_input(
-        "Mid size",
-        min_value=0,
-        max_value=200,
-        value=6,
-        step=1,
-        help="Medium confidence set. Core + Mid ≤ Top N; Edge = remaining.",
-    )
-
-    if core_n + mid_n > top_n:
-        st.warning("Core + Mid must be ≤ Top N. Adjust the sizes.")
-
-    run_button = st.button("Train model & score numbers", type="primary")
-
-# -----------------------------
-# Main logic
-# -----------------------------
-if not file:
-    st.info("⬅️ Upload your CSV in the sidebar to get started.")
-    st.stop()
-
-# Load and normalize data
-try:
-    df_raw = load_csv(file)
-    df_base = prepare_base_df(df_raw)
-except Exception as e:
-    st.error(f"Could not parse CSV: {e}")
-    st.stop()
-
-st.success(
-    f"Loaded {len(df_base)} draw days "
-    f"from {df_base['date'].min().date()} to {df_base['date'].max().date()}."
 )
 
-# Choose lottery column
-lottery_map = {
-    "DR": "DR_nums",
-    "FB": "FB_nums",
-    "GZ/GB": "GZGB_nums",
-    "GL": "GL_nums",
-}
-lottery_choice = st.selectbox(
-    "Lottery column for modeling",
-    options=list(lottery_map.keys()),
-    index=0,
-)
-lottery_col = lottery_map[lottery_choice]
+# ---- Shared CSV upload ---- #
+col_up_left, col_up_right = st.columns([2, 1])
 
-# Build per-number dataset
-st.markdown("### Step 1 — Build per-number dataset")
-with st.expander("Show details of expanded training data (optional)", expanded=False):
-    st.write(
-        "We expand each draw day into rows for every number (0…max). "
-        "Each row is labeled 1 if the number appeared in the chosen lottery column, else 0."
-    )
+with col_up_left:
+    uploaded = st.file_uploader("Upload CSV (same format as calcnew.html)", type=["csv", "tsv"])
 
-df_events = build_number_day_dataset(df_base, int(max_num), lottery_col)
+with col_up_right:
+    rmin = st.number_input("Range min (0–99)", min_value=0, max_value=99, value=0)
+    rmax = st.number_input("Range max (0–99)", min_value=0, max_value=99, value=9)
+    custom_text = st.text_input("Custom numbers (comma/space separated)", placeholder="e.g. 5, 11, 44, 88")
+    custom_only = st.checkbox("Custom only (ignore range)")
 
-st.write(
-    f"Expanded to **{len(df_events):,} rows** "
-    f"({len(df_events) // (int(max_num) + 1):,} days × {int(max_num) + 1} numbers)."
-)
+if rmin > rmax:
+    st.warning("Range min > max; swapped internally.")
+    rmin, rmax = rmax, rmin
 
-# Target prediction date
-default_target = (df_base["date"].max() + pd.Timedelta(days=1)).date()
-target_date = st.date_input(
-    "Target draw date for prediction",
-    min_value=df_base["date"].min().date(),
-    max_value=(df_base["date"].max() + pd.Timedelta(days=365)).date(),
-    value=default_target,
-)
+custom_set = parse_custom_nums(custom_text)
 
-if not run_button:
-    st.info("Set your parameters in the sidebar and click **Train model & score numbers**.")
-    st.stop()
+if "built_df" not in st.session_state:
+    st.session_state["built_df"] = None
+    st.session_state["has_gz"] = True
+    st.session_state["range"] = (rmin, rmax)
+    st.session_state["custom_set"] = custom_set
+    st.session_state["custom_only"] = custom_only
+    st.session_state["cb_range_model"] = None
+    st.session_state["cb_range_metrics"] = None
+    st.session_state["ens_model"] = None
+    st.session_state["ens_metrics"] = None
 
-# -----------------------------
-# Train CatBoost model
-# -----------------------------
-with st.spinner("Training CatBoost model (monthly-only features)…"):
-    model, split_date, valid_acc = train_catboost_model(df_events)
+analyze_clicked = st.button("Analyze & Prepare Data")
 
-st.success(
-    f"CatBoost trained. Validation accuracy (time-based split @ {split_date.date()}): "
-    f"**{valid_acc*100:.2f}%**"
-)
+if analyze_clicked and not uploaded:
+    st.error("Please upload a CSV first.")
 
-# -----------------------------
-# Monthly-only probability engine
-# -----------------------------
-probs_for_month_fn, monthly_counts, monthly_totals = compute_monthly_probs(
-    df_base, lottery_col, split_date, int(max_num), alpha
-)
+if uploaded and analyze_clicked:
+    try:
+        date_map, count_dates, has_gz = load_csv_to_map(uploaded)
+        built_df = build_rows_df(date_map, rmin, rmax, custom_set, custom_only)
+        st.session_state["built_df"] = built_df
+        st.session_state["has_gz"] = has_gz
+        st.session_state["range"] = (rmin, rmax)
+        st.session_state["custom_set"] = custom_set
+        st.session_state["custom_only"] = custom_only
+        st.session_state["cb_range_model"] = None
+        st.session_state["cb_range_metrics"] = None
+        st.session_state["ens_model"] = None
+        st.session_state["ens_metrics"] = None
+        st.success(f"Parsed {count_dates} unique dates from CSV.")
+    except Exception as e:
+        st.error(f"Error parsing CSV: {e}")
 
-target_month = target_date.month
-month_probs = probs_for_month_fn(target_month)
+built_df = st.session_state.get("built_df", None)
 
-# -----------------------------
-# ML scores for target date
-# -----------------------------
-target_ts = pd.Timestamp(target_date)
-target_features = pd.DataFrame(
-    {
-        "month": [target_ts.month] * (int(max_num) + 1),
-        "dow": [target_ts.weekday()] * (int(max_num) + 1),
-        "dom": [target_ts.day] * (int(max_num) + 1),
-        "num": list(range(int(max_num) + 1)),
-    }
-)
+# -------------------- Tabs -------------------- #
+tab1, tab2 = st.tabs(["Range Wins + CatBoost (Any WIN)", "ML — Ensemble Number Prediction (0–99)"])
 
-ml_probs = model.predict_proba(target_features)[:, 1]
+# ==================== TAB 1: Range Wins ==================== #
+with tab1:
+    if built_df is None or built_df.empty:
+        st.info("Upload a CSV and click **Analyze & Prepare Data** to use this section.")
+    else:
+        rmin, rmax = st.session_state["range"]
+        custom_set = st.session_state["custom_set"]
+        custom_only = st.session_state["custom_only"]
 
-# -----------------------------
-# Blend ML + monthly-only probability
-# -----------------------------
-final_scores = (1.0 - blend_weight) * ml_probs + blend_weight * month_probs
+        st.subheader("Per-day Range Wins")
 
-results = pd.DataFrame(
-    {
-        "number": np.arange(int(max_num) + 1),
-        "ml_prob": ml_probs,
-        "month_prob": month_probs,
-        "final_score": final_scores,
-    }
-).sort_values("final_score", ascending=False)
-
-st.markdown("### Step 2 — Ranked numbers (Monthly-only probability strategy)")
-
-# Core / Mid / Edge
-if core_n + mid_n > top_n:
-    st.error("Core + Mid must be ≤ Top N. Please adjust sizes in the sidebar.")
-else:
-    top_df = results.head(int(top_n)).reset_index(drop=True)
-    core_df = top_df.iloc[: int(core_n)]
-    mid_df = top_df.iloc[int(core_n) : int(core_n + mid_n)]
-    edge_df = top_df.iloc[int(core_n + mid_n) :]
-
-    col_core, col_mid, col_edge = st.columns(3)
-
-    with col_core:
-        st.subheader(f"Core ({len(core_df)})")
-        st.dataframe(
-            core_df[["number", "final_score", "ml_prob", "month_prob"]],
-            use_container_width=True,
+        summary = summarize_wins(built_df)
+        cols = st.columns(5)
+        cols[0].metric("Total days", summary["total_days"])
+        cols[1].metric("DR WIN days", summary["DR"])
+        cols[2].metric("FB WIN days", summary["FB"])
+        cols[3].metric("GZ/GB WIN days", summary["GZGB"])
+        cols[4].metric("GL WIN days", summary["GL"])
+        st.caption(
+            f"Any WIN days: **{summary['ANY']}**  • "
+            f"Range: `{rmin}-{rmax}`  • Custom: {sorted(list(custom_set)) or 'None'}"
         )
 
-    with col_mid:
-        st.subheader(f"Mid ({len(mid_df)})")
-        st.dataframe(
-            mid_df[["number", "final_score", "ml_prob", "month_prob"]],
-            use_container_width=True,
+        table_df = pd.DataFrame(
+            {
+                "#": range(1, len(built_df) + 1),
+                "Date": built_df["date_key"],
+                "Day": built_df["dow_label"],
+                "DR": built_df["DR"].apply(format_nums),
+                "DR Status": np.where(built_df["DR_win"], "WIN", "NOT WIN"),
+                "FB": built_df["FB"].apply(format_nums),
+                "FB Status": np.where(built_df["FB_win"], "WIN", "NOT WIN"),
+                "GZ/GB": built_df["GZGB"].apply(format_nums),
+                "GZ/GB Status": np.where(built_df["GZGB_win"], "WIN", "NOT WIN"),
+                "GL": built_df["GL"].apply(format_nums),
+                "GL Status": np.where(built_df["GL_win"], "WIN", "NOT WIN"),
+                "Any WIN": np.where(built_df["any_win"], "WIN", "NOT WIN"),
+            }
+        )
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+        dl_df = table_df.copy()
+        dl_df["Range"] = f"{rmin}-{rmax}"
+        csv_bytes = dl_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download analyzed CSV",
+            data=csv_bytes,
+            file_name="lottery_range_wins.csv",
+            mime="text/csv",
         )
 
-    with col_edge:
-        st.subheader(f"Edge ({len(edge_df)})")
-        st.dataframe(
-            edge_df[["number", "final_score", "ml_prob", "month_prob"]],
-            use_container_width=True,
+        st.markdown("---")
+        st.subheader("Probability Engine (Day-of-Week / Day-of-Month)")
+
+        c1, c2, c3, c4 = st.columns(4)
+        mode_label = c1.selectbox("Mode", ["Day-of-Week", "Day-of-Month"])
+        alpha = c2.number_input("Alpha (smoothing)", min_value=0.0, value=2.0, step=0.5)
+        lam = c3.number_input("Decay λ (recency)", min_value=0.0, value=0.01, step=0.005, format="%0.5f")
+        advanced = c4.checkbox("Use advanced blend", value=True)
+
+        if st.button("Run Probability", key="prob_run"):
+            mode = "dow" if mode_label == "Day-of-Week" else "dom"
+            prob_res = analyze_prob(built_df, mode=mode, alpha=alpha, lam=lam, advanced=advanced)
+            if prob_res is None:
+                st.warning("No data.")
+            else:
+                prob_df = pd.DataFrame(prob_res["results"])
+                display_df = prob_df.copy()
+                for col in ["basic", "smoothed", "weighted", "final"]:
+                    display_df[col] = (display_df[col] * 100.0).round(2)
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                chart_df = prob_df[["bucket", "final"]].set_index("bucket")
+                st.bar_chart(chart_df)
+
+        st.markdown("---")
+        st.subheader("CatBoost Model — Any WIN for Range/Custom")
+
+        if not CATBOOST_AVAILABLE:
+            st.error("CatBoost is not installed. Install it with `pip install catboost`.")
+        else:
+            train_ratio = st.slider(
+                "Train/Test split (chronological train size)",
+                min_value=0.6,
+                max_value=0.9,
+                value=0.8,
+                step=0.05,
+                key="range_train_ratio",
+            )
+
+            if st.button("Train CatBoost model (range-level)", key="range_train_btn"):
+                with st.spinner("Training CatBoost (range-level)..."):
+                    model, metrics = train_catboost_range(
+                        built_df, rmin=rmin, rmax=rmax, custom_set=custom_set, train_ratio=train_ratio
+                    )
+                    st.session_state["cb_range_model"] = model
+                    st.session_state["cb_range_metrics"] = metrics
+
+                m = metrics
+                mcols = st.columns(5)
+                mcols[0].metric("Train samples", m["n_train"])
+                mcols[1].metric("Test samples", m["n_test"])
+                mcols[2].metric("Accuracy", f"{m['accuracy']*100:.2f}%" if not np.isnan(m["accuracy"]) else "NA")
+                mcols[3].metric("Precision", f"{m['precision']*100:.2f}%" if not np.isnan(m["precision"]) else "NA")
+                mcols[4].metric("Recall", f"{m['recall']*100:.2f}%" if not np.isnan(m["recall"]) else "NA")
+                st.caption(f"AUC: {m['auc']:.4f}" if not np.isnan(m["auc"]) else "AUC: NA")
+
+            cb_model = st.session_state.get("cb_range_model")
+            if cb_model is not None:
+                st.success("Range-level CatBoost model trained.")
+                pred_date = st.date_input(
+                    "Pick a date to score Any-WIN probability for this range/custom",
+                    value=date.today(),
+                    key="range_pred_date",
+                )
+                if st.button("Predict Any-WIN probability for this date", key="range_pred_btn"):
+                    X_new = make_single_features_for_date_range(pred_date, rmin, rmax, custom_set)
+                    proba = cb_model.predict_proba(X_new)[:, 1][0]
+                    st.metric("Predicted Any-WIN probability", f"{proba*100:.2f}%")
+            else:
+                st.info("Train the range-level CatBoost model to enable date-wise predictions.")
+
+# ==================== TAB 2: ML Ensemble 0–99 ==================== #
+with tab2:
+    if built_df is None or built_df.empty:
+        st.info("Upload a CSV and click **Analyze & Prepare Data** first. This populates the dataset.")
+    elif not CATBOOST_AVAILABLE:
+        st.error("CatBoost is not installed. Install it with `pip install catboost` to use the ensemble model.")
+    else:
+        st.subheader("ML — Ensemble Number Prediction (0–99)")
+
+        col_top_left, col_top_mid, col_top_right = st.columns(3)
+        lottery_choice = col_top_left.selectbox(
+            "Lottery",
+            ["DR", "FB", "GZ/GB", "GL"],
+            index=0,
         )
 
-    st.markdown("#### Full ranking")
-    st.dataframe(results, use_container_width=True)
+        prob_mode_label = col_top_mid.radio(
+            "Probability Weight Strategy",
+            ["Weekly only", "Monthly only", "Weekly + Monthly (avg)", "Recency-weighted (3-month focus)"],
+        )
+
+        prob_weight = col_top_right.number_input(
+            "ML / Probability blending (0 = pure ML, 1 = pure probability)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.4,
+            step=0.05,
+        )
+
+        lot_key_map = {
+            "DR": "DR",
+            "FB": "FB",
+            "GZ/GB": "GZGB",
+            "GL": "GL",
+        }
+        lottery_key = lot_key_map[lottery_choice]
+
+        st.markdown(
+            "*Default 0.4 = 60% ML + 40% probability, exactly matching your browser slider semantics.*"
+        )
+
+        st.markdown("---")
+        st.markdown("**Core / Mid / Edge sizing** — `Core + Mid ≤ Top N` (Edge = remaining).")
+        c1, c2, c3 = st.columns(3)
+        top_n = c1.number_input("Top N numbers", min_value=1, max_value=100, value=20, step=1)
+        core_count = c2.number_input("Core size", min_value=0, max_value=100, value=8, step=1)
+        mid_count = c3.number_input("Mid size", min_value=0, max_value=100, value=6, step=1)
+
+        # Enforce Core + Mid ≤ Top N
+        if core_count + mid_count > top_n:
+            mid_count = max(0, top_n - core_count)
+            st.warning(f"Adjusted Mid to {mid_count} so Core + Mid ≤ Top N.")
+
+        edge_count = max(0, top_n - core_count - mid_count)
+
+        st.caption(
+            f"Core: **{core_count}**, Mid: **{mid_count}**, Edge (within Top N): **{edge_count}**."
+        )
+
+        st.markdown("---")
+        st.subheader("1) Train Ensemble Model (CatBoost replacement)")
+
+        ens_train_ratio = st.slider(
+            "Train/Validation split (chronological)",
+            min_value=0.6,
+            max_value=0.9,
+            value=0.8,
+            step=0.05,
+            key="ens_train_ratio",
+        )
+
+        if st.button("Train Ensemble Model (CatBoost)", key="ens_train_btn"):
+            with st.spinner("Training CatBoost ensemble model (0–99)..."):
+                model, metrics = ens_train_catboost(built_df, lottery_key, train_ratio=ens_train_ratio)
+                st.session_state["ens_model"] = model
+                st.session_state["ens_metrics"] = metrics
+
+            m = metrics
+            mcols = st.columns(4)
+            mcols[0].metric("Samples", m["samples"])
+            mcols[1].metric("Train samples", m["n_train"])
+            mcols[2].metric("Val samples", m["n_val"])
+            mcols[3].metric(
+                "Val accuracy",
+                f"{m['val_accuracy']*100:.2f}%" if not np.isnan(m["val_accuracy"]) else "NA",
+            )
+            st.caption(
+                f"AUC: {m['val_auc']:.4f}" if not np.isnan(m["val_auc"]) else "AUC: NA"
+            )
+
+        ens_model = st.session_state.get("ens_model")
+
+        st.markdown("---")
+        st.subheader("2) Score numbers 0–99 for a prediction date")
+
+        if ens_model is None:
+            st.info("Train the ensemble model first.")
+        else:
+            # Default prediction date: day after last data date
+            last_date = built_df["date"].max().date()
+            default_pred_date = last_date + timedelta(days=1)
+            pred_date = st.date_input(
+                "Prediction date (for ranking 0–99)",
+                value=default_pred_date,
+                key="ens_pred_date",
+            )
+
+            prob_mode_map = {
+                "Weekly only": "weekly",
+                "Monthly only": "monthly",
+                "Weekly + Monthly (avg)": "both",
+                "Recency-weighted (3-month focus)": "recent",
+            }
+            prob_mode = prob_mode_map[prob_mode_label]
+
+            if st.button("Score numbers (Core / Mid / Edge)", key="ens_score_btn"):
+                with st.spinner("Scoring numbers 0–99 with ML + probability fusion..."):
+                    scored_sorted = ens_score_numbers_for_date(
+                        ens_model,
+                        built_df,
+                        lottery_key=lottery_key,
+                        prob_mode=prob_mode,
+                        prob_weight_coeff=float(prob_weight),
+                        prediction_date=pred_date,
+                    )
+
+                top_list = scored_sorted[: int(top_n)]
+                rows = []
+                for idx, item in enumerate(top_list):
+                    num = item["number"]
+                    ml_score = item["ml_score"]
+                    prob_score = item["prob_score"]
+                    final_score = item["final_score"]
+
+                    if idx < core_count:
+                        tier = "Core"
+                    elif idx < core_count + mid_count:
+                        tier = "Mid"
+                    else:
+                        tier = "Edge"
+
+                    rows.append(
+                        {
+                            "Rank": idx + 1,
+                            "Number": num,
+                            "Tier": tier,
+                            "Final Score": round(final_score, 6),
+                            "ML Score": round(ml_score, 6),
+                            "Prob Score": round(prob_score, 6),
+                        }
+                    )
+
+                result_df = pd.DataFrame(rows)
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download Top-N (Core/Mid/Edge) as CSV",
+                    data=csv_bytes,
+                    file_name="ml_ensemble_top_numbers.csv",
+                    mime="text/csv",
+                )
+
+                st.success(
+                    f"Scored numbers 0–99 for {pred_date.isoformat()} "
+                    f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
+                    f"blend={prob_weight:.2f}."
+                )
