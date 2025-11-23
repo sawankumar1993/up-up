@@ -466,15 +466,26 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     return model, metrics
 
 
-def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: bool):
+def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str,
+                              lam_weekly: float, lam_monthly: float):
+    """
+    Build weekly & monthly profiles with separate decay for weekly and monthly,
+    plus hierarchical global+DOM smoothing for monthly:
+
+      p_dom_smooth = (1 - gamma) * p_global + gamma * p_dom_raw
+    """
     now_ts = int(datetime.utcnow().timestamp() * 1000)
     day_ms = 24 * 60 * 60 * 1000
-    lam = 0.02
 
+    # Raw counters
     hits_num_dow = np.zeros((100, 7), dtype=float)
-    hits_num_dom = np.zeros((100, 32), dtype=float)
+    hits_num_dom = np.zeros((100, 32), dtype=float)  # 1..31 used
     tot_dow = np.zeros(7, dtype=float)
     tot_dom = np.zeros(32, dtype=float)
+
+    # Global counts for hierarchical smoothing
+    global_hits = np.zeros(100, dtype=float)
+    global_tot = 0.0
 
     df_sorted = df.sort_values("date")
     for _, row in df_sorted.iterrows():
@@ -496,10 +507,13 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
 
         ts = int(row["timestamp"] * 1000)
         age_days = max(0.0, (now_ts - ts) / day_ms)
-        w = float(np.exp(-lam * age_days)) if recency_mode else 1.0
 
-        tot_dow[dow_index] += w
-        tot_dom[dd] += w
+        # Separate decays for weekly and monthly; 0 means "no decay"
+        w_week = float(np.exp(-lam_weekly * age_days)) if lam_weekly > 0 else 1.0
+        w_month = float(np.exp(-lam_monthly * age_days)) if lam_monthly > 0 else 1.0
+
+        tot_dow[dow_index] += w_week
+        tot_dom[dd] += w_month
 
         nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
         for raw in nums_arr:
@@ -508,14 +522,17 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
             except ValueError:
                 continue
             if 0 <= num <= 99:
-                hits_num_dow[num, dow_index] += w
-                hits_num_dom[num, dd] += w
+                hits_num_dow[num, dow_index] += w_week
+                hits_num_dom[num, dd] += w_month
+                global_hits[num] += w_month
+                global_tot += w_month
 
     weekly_profile = np.zeros((100, 7), dtype=float)
     monthly_profile = np.zeros((100, 32), dtype=float)
     max_weekly = 0.0
     max_monthly = 0.0
 
+    # Weekly profile: per-number, per-DOW probability
     for num in range(100):
         for d in range(7):
             tot = tot_dow[d]
@@ -524,13 +541,26 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
                 weekly_profile[num, d] = p
                 if p > max_weekly:
                     max_weekly = p
+
+    # Monthly profile: hierarchical smoothing with global frequency
+    gamma = 0.7  # weight for DOM-specific vs global probability
+    p_global_arr = np.zeros(100, dtype=float)
+    if global_tot > 0:
+        p_global_arr = global_hits / global_tot
+
+    for num in range(100):
+        p_global = p_global_arr[num]
         for dom in range(1, 32):
             tot = tot_dom[dom]
             if tot > 0:
-                p = hits_num_dom[num, dom] / tot
-                monthly_profile[num, dom] = p
-                if p > max_monthly:
-                    max_monthly = p
+                p_dom_raw = hits_num_dom[num, dom] / tot
+                p_dom = (1.0 - gamma) * p_global + gamma * p_dom_raw
+            else:
+                # No DOM-specific info → fall back to global
+                p_dom = p_global
+            monthly_profile[num, dom] = p_dom
+            if p_dom > max_monthly:
+                max_monthly = p_dom
 
     return {
         "weekly_profile": weekly_profile,
@@ -563,13 +593,16 @@ def ens_score_numbers_for_date(
     prob_mode: str,
     prob_weight_coeff: float,
     prediction_date: date,
+    lam_weekly: float,
+    lam_monthly: float,
 ):
     if df.empty:
         raise ValueError("No data loaded.")
 
-    # Build probability profiles
-    use_recency_profiles = (prob_mode == "recent")
-    profiles = ens_build_number_profiles(df, lottery_key, recency_mode=use_recency_profiles)
+    # Build probability profiles with tuned decays
+    profiles = ens_build_number_profiles(df, lottery_key,
+                                         lam_weekly=lam_weekly,
+                                         lam_monthly=lam_monthly)
     weekly_profile = profiles["weekly_profile"]
     monthly_profile = profiles["monthly_profile"]
     max_weekly = profiles["max_weekly"]
@@ -612,6 +645,7 @@ def ens_score_numbers_for_date(
             w_month = monthly_profile[num, dd]
             norm_month = w_month / max_monthly
 
+        # Base probability weight from weekly/monthly profiles
         if prob_mode == "weekly":
             w_num = norm_week
         elif prob_mode == "monthly":
@@ -624,6 +658,7 @@ def ens_score_numbers_for_date(
                 vals.append(norm_month)
             w_num = sum(vals) / len(vals) if vals else 0.0
         elif prob_mode == "recent":
+            # Recency-focused score using hit timelines
             hits = hit_dates[num]
             rec_score = 0.0
             if hits:
@@ -661,6 +696,125 @@ def ens_score_numbers_for_date(
 
     scored_sorted = sorted(scored, key=lambda r: r["final_score"], reverse=True)
     return scored_sorted
+
+
+def run_ensemble_backtest(
+    built_df: pd.DataFrame,
+    ens_model,
+    lottery_key: str,
+    prob_mode: str,
+    prob_weight: float,
+    top_n: int,
+    core_count: int,
+    mid_count: int,
+    eval_start: date,
+    eval_end: date,
+    lam_weekly: float,
+    lam_monthly: float,
+):
+    """
+    Re-usable backtest helper:
+    returns metrics dict + detail_df (per-day hits).
+    Metrics match your existing semantics:
+    - total_hits_all = total hits (all tiers) across all days
+    - avg_hits_per_date = total_hits_all / dates_with_data
+    - core_hit_rate = core_hits_total / dates_with_data * 100
+    - core_mid_hit_rate = core_mid_hits_total / dates_with_data * 100
+    - any_tier_hit_rate = total_hits_all / dates_with_data * 100
+    """
+    total_calendar_days = (eval_end - eval_start).days + 1
+    dates_with_data = 0
+    total_hits_all = 0
+    core_hits_total = 0
+    core_mid_hits_total = 0
+
+    detail_rows = []
+
+    for offset in range(total_calendar_days):
+        d = eval_start + timedelta(days=offset)
+        mask = built_df["date"].dt.date == d
+        if not mask.any():
+            continue
+
+        row = built_df.loc[mask].iloc[0]
+        actual_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+        actual_set = set()
+        for x in actual_arr:
+            try:
+                v = int(x)
+            except Exception:
+                continue
+            if 0 <= v <= 99:
+                actual_set.add(v)
+
+        if not actual_set:
+            continue
+
+        dates_with_data += 1
+
+        scored_sorted = ens_score_numbers_for_date(
+            ens_model,
+            built_df,
+            lottery_key=lottery_key,
+            prob_mode=prob_mode,
+            prob_weight_coeff=float(prob_weight),
+            prediction_date=d,
+            lam_weekly=lam_weekly,
+            lam_monthly=lam_monthly,
+        )
+
+        top_list = scored_sorted[: int(top_n)]
+
+        core_hits = 0
+        mid_hits = 0
+        edge_hits = 0
+
+        for idx, item in enumerate(top_list):
+            num = item["number"]
+            if num in actual_set:
+                if idx < core_count:
+                    core_hits += 1
+                elif idx < core_count + mid_count:
+                    mid_hits += 1
+                else:
+                    edge_hits += 1
+
+        day_total_hits = core_hits + mid_hits + edge_hits
+        total_hits_all += day_total_hits
+        core_hits_total += core_hits
+        core_mid_hits_total += core_hits + mid_hits
+
+        detail_rows.append(
+            {
+                "Date": d.isoformat(),
+                "Day": row["dow_label"],
+                "Actual": " ".join(str(n) for n in sorted(actual_set)),
+                "Core Hits": core_hits,
+                "Mid Hits": mid_hits,
+                "Edge Hits": edge_hits,
+                "Total Hits": day_total_hits,
+            }
+        )
+
+    if dates_with_data == 0:
+        return None, pd.DataFrame([])
+
+    avg_hits_per_date = total_hits_all / dates_with_data
+    core_hit_rate = (core_hits_total / dates_with_data) * 100.0
+    core_mid_hit_rate = (core_mid_hits_total / dates_with_data) * 100.0
+    any_tier_hit_rate = (total_hits_all / dates_with_data) * 100.0
+
+    metrics = {
+        "dates_in_range": total_calendar_days,
+        "dates_with_data": dates_with_data,
+        "total_hits_all": total_hits_all,
+        "avg_hits_per_date": avg_hits_per_date,
+        "core_hit_rate": core_hit_rate,
+        "core_mid_hit_rate": core_mid_hit_rate,
+        "any_tier_hit_rate": any_tier_hit_rate,
+    }
+    detail_df = pd.DataFrame(detail_rows)
+    return metrics, detail_df
 
 
 # -------------------- Streamlit UI -------------------- #
@@ -732,9 +886,9 @@ if uploaded and analyze_clicked:
         st.session_state["cb_range_metrics"] = None
         st.session_state["ens_model"] = None
         st.session_state["ens_metrics"] = None
-        print(f"Parsed {count_dates} unique dates from CSV.")
+        st.success(f"Parsed {count_dates} unique dates from CSV.")
     except Exception as e:
-        print(f"Error parsing CSV: {e}")
+        st.error(f"Error parsing CSV: {e}")
 
 built_df = st.session_state.get("built_df", None)
 
@@ -904,10 +1058,33 @@ with tab2:
             "*Default 0.4 = 60% ML + 40% probability, exactly matching your browser slider semantics.*"
         )
 
+        # NEW: advanced weekly/monthly decay controls
+        with st.expander("Advanced: Weekly/Monthly decay (λ)", expanded=False):
+            lam_weekly = st.number_input(
+                "Weekly decay λ (0 = no decay)",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.02,
+                step=0.005,
+                key="lam_weekly",
+            )
+            lam_monthly = st.number_input(
+                "Monthly decay λ (0 = no decay)",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.02,
+                step=0.005,
+                key="lam_monthly",
+            )
+            st.caption(
+                "These λ values control how fast older hits fade in the weekly/monthly profiles. "
+                "Higher λ = stronger focus on recent data."
+            )
+
         st.markdown("---")
         st.markdown("**Core / Mid / Edge sizing** — `Core + Mid ≤ Top N` (Edge = remaining).")
         c1, c2, c3 = st.columns(3)
-        top_n = c1.number_input("Top N numbers", min_value=1, max_value=100, value=20, step=1)
+        top_n = c1.number_input("Top N numbers", min_value=1, max_value=100, value=25, step=1)
         core_count = c2.number_input("Core size", min_value=0, max_value=100, value=8, step=1)
         mid_count = c3.number_input("Mid size", min_value=0, max_value=100, value=6, step=1)
 
@@ -987,6 +1164,8 @@ with tab2:
                         prob_mode=prob_mode,
                         prob_weight_coeff=float(prob_weight),
                         prediction_date=pred_date,
+                        lam_weekly=lam_weekly,
+                        lam_monthly=lam_monthly,
                     )
 
                 top_list = scored_sorted[: int(top_n)]
@@ -1057,101 +1236,44 @@ with tab2:
             if eval_start > eval_end:
                 st.error("Evaluation start date is after end date.")
             else:
-                if st.button("Run ensemble backtest", key="ens_backtest_btn"):
-                    total_calendar_days = (eval_end - eval_start).days + 1
-                    dates_with_data = 0
-                    total_hits_all = 0
-                    core_hits_total = 0
-                    core_mid_hits_total = 0
+                col_bt1, col_bt2 = st.columns(2)
+                run_backtest = col_bt1.button("Run ensemble backtest", key="ens_backtest_btn")
+                run_gridsearch = col_bt2.button("Grid search prob_weight on this range", key="ens_grid_btn")
 
-                    detail_rows = []
-
-                    for offset in range(total_calendar_days):
-                        d = eval_start + timedelta(days=offset)
-                        mask = built_df["date"].dt.date == d
-                        if not mask.any():
-                            continue
-
-                        row = built_df.loc[mask].iloc[0]
-                        actual_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
-                        actual_set = set()
-                        for x in actual_arr:
-                            try:
-                                v = int(x)
-                            except Exception:
-                                continue
-                            if 0 <= v <= 99:
-                                actual_set.add(v)
-
-                        if not actual_set:
-                            continue
-
-                        dates_with_data += 1
-
-                        scored_sorted = ens_score_numbers_for_date(
-                            ens_model,
+                # Main backtest
+                if run_backtest:
+                    with st.spinner("Running ensemble backtest on selected range..."):
+                        metrics_bt, detail_df = run_ensemble_backtest(
                             built_df,
+                            ens_model,
                             lottery_key=lottery_key,
                             prob_mode=prob_mode,
-                            prob_weight_coeff=float(prob_weight),
-                            prediction_date=d,
+                            prob_weight=prob_weight,
+                            top_n=int(top_n),
+                            core_count=int(core_count),
+                            mid_count=int(mid_count),
+                            eval_start=eval_start,
+                            eval_end=eval_end,
+                            lam_weekly=lam_weekly,
+                            lam_monthly=lam_monthly,
                         )
 
-                        top_list = scored_sorted[: int(top_n)]
-
-                        core_hits = 0
-                        mid_hits = 0
-                        edge_hits = 0
-
-                        for idx, item in enumerate(top_list):
-                            num = item["number"]
-                            if num in actual_set:
-                                if idx < core_count:
-                                    core_hits += 1
-                                elif idx < core_count + mid_count:
-                                    mid_hits += 1
-                                else:
-                                    edge_hits += 1
-
-                        day_total_hits = core_hits + mid_hits + edge_hits
-                        total_hits_all += day_total_hits
-                        core_hits_total += core_hits
-                        core_mid_hits_total += core_hits + mid_hits
-
-                        detail_rows.append(
-                            {
-                                "Date": d.isoformat(),
-                                "Day": row["dow_label"],
-                                "Actual": " ".join(str(n) for n in sorted(actual_set)),
-                                "Core Hits": core_hits,
-                                "Mid Hits": mid_hits,
-                                "Edge Hits": edge_hits,
-                                "Total Hits": day_total_hits,
-                            }
-                        )
-
-                    if dates_with_data == 0:
+                    if metrics_bt is None:
                         st.warning("No dates with actual data found in this range for backtesting.")
                     else:
-                        avg_hits_per_date = total_hits_all / dates_with_data
-                        core_hit_rate = (core_hits_total / dates_with_data) * 100.0
-                        core_mid_hit_rate = (core_mid_hits_total / dates_with_data) * 100.0
-                        any_tier_hit_rate = (total_hits_all / dates_with_data) * 100.0
-
                         m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("Dates in range", total_calendar_days)
-                        m2.metric("Dates with actual data", dates_with_data)
-                        m3.metric("Total hits (all tiers)", total_hits_all)
-                        m4.metric("Avg hits / date (past only)", f"{avg_hits_per_date:.2f}")
+                        m1.metric("Dates in range", metrics_bt["dates_in_range"])
+                        m2.metric("Dates with actual data", metrics_bt["dates_with_data"])
+                        m3.metric("Total hits (all tiers)", metrics_bt["total_hits_all"])
+                        m4.metric("Avg hits / date (past only)", f"{metrics_bt['avg_hits_per_date']:.2f}")
 
                         n1, n2, n3, n4 = st.columns(4)
-                        n1.metric("Core hit rate", f"{core_hit_rate:.1f}%")
-                        n2.metric("Core+Mid hit rate", f"{core_mid_hit_rate:.1f}%")
-                        n3.metric("Any tier hit rate", f"{any_tier_hit_rate:.1f}%")
+                        n1.metric("Core hit rate", f"{metrics_bt['core_hit_rate']:.1f}%")
+                        n2.metric("Core+Mid hit rate", f"{metrics_bt['core_mid_hit_rate']:.1f}%")
+                        n3.metric("Any tier hit rate", f"{metrics_bt['any_tier_hit_rate']:.1f}%")
                         n4.metric("Lottery", lottery_choice)
 
-                        if detail_rows:
-                            detail_df = pd.DataFrame(detail_rows)
+                        if not detail_df.empty:
                             st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
                             csv_bytes = detail_df.to_csv(index=False).encode("utf-8")
@@ -1161,6 +1283,55 @@ with tab2:
                                 file_name="ensemble_backtest_details.csv",
                                 mime="text/csv",
                             )
+
+                # Grid search for best prob_weight on this range
+                if run_gridsearch:
+                    with st.spinner("Grid-searching prob_weight on selected range..."):
+                        grid_weights = [0.0, 0.2, 0.4, 0.6, 0.8]
+                        rows = []
+                        best_w = None
+                        best_metrics = None
+
+                        for w in grid_weights:
+                            metrics_w, _ = run_ensemble_backtest(
+                                built_df,
+                                ens_model,
+                                lottery_key=lottery_key,
+                                prob_mode=prob_mode,
+                                prob_weight=w,
+                                top_n=int(top_n),
+                                core_count=int(core_count),
+                                mid_count=int(mid_count),
+                                eval_start=eval_start,
+                                eval_end=eval_end,
+                                lam_weekly=lam_weekly,
+                                lam_monthly=lam_monthly,
+                            )
+                            if metrics_w is None:
+                                continue
+                            rows.append(
+                                {
+                                    "prob_weight": w,
+                                    "Any tier hit rate (%)": metrics_w["any_tier_hit_rate"],
+                                    "Core hit rate (%)": metrics_w["core_hit_rate"],
+                                    "Core+Mid hit rate (%)": metrics_w["core_mid_hit_rate"],
+                                    "Avg hits / date": metrics_w["avg_hits_per_date"],
+                                }
+                            )
+                            if best_metrics is None or metrics_w["any_tier_hit_rate"] > best_metrics["any_tier_hit_rate"]:
+                                best_metrics = metrics_w
+                                best_w = w
+
+                    if not rows:
+                        st.warning("No valid backtest results for any prob_weight on this range.")
+                    else:
+                        st.success(
+                            f"Best prob_weight = {best_w:.2f} with "
+                            f"Any tier hit rate = {best_metrics['any_tier_hit_rate']:.1f}% "
+                            f"on this range."
+                        )
+                        grid_df = pd.DataFrame(rows).sort_values("prob_weight")
+                        st.dataframe(grid_df, use_container_width=True, hide_index=True)
 
 # ==================== Global Date Range Lookup ==================== #
 
@@ -1223,7 +1394,7 @@ else:
                         "GZ/GB": df_range["GZGB"].apply(format_nums),
                         "GZ/GB Status": np.where(df_range["GZGB_win"], "WIN", "NOT WIN"),
                         "GL": df_range["GL"].apply(format_nums),
-                        "GL Status": np.where(df_range["GL_win"], "WIN", "NOT WIN"),
+                        "GL Status": np.where[df_range["GL_win"], "WIN", "NOT WIN"],
                         "Any WIN": np.where(df_range["any_win"], "WIN", "NOT WIN"),
                     }
                 )
