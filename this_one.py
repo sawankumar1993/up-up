@@ -732,9 +732,9 @@ if uploaded and analyze_clicked:
         st.session_state["cb_range_metrics"] = None
         st.session_state["ens_model"] = None
         st.session_state["ens_metrics"] = None
-        st.success(f"Parsed {count_dates} unique dates from CSV.")
+        print(f"Parsed {count_dates} unique dates from CSV.")
     except Exception as e:
-        st.error(f"Error parsing CSV: {e}")
+        print(f"Error parsing CSV: {e}")
 
 built_df = st.session_state.get("built_df", None)
 
@@ -1031,6 +1031,136 @@ with tab2:
                     f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
                     f"blend={prob_weight:.2f}."
                 )
+
+        # 3) Backtest ensemble vs actual for a date range
+        if ens_model is not None:
+            st.markdown("---")
+            st.subheader("3) Backtest ensemble vs actual results (date range)")
+
+            eval_min_date = built_df["date"].min().date()
+            eval_max_date = built_df["date"].max().date()
+
+            eval_date_sel = st.date_input(
+                "Evaluation date range (for backtesting)",
+                (eval_min_date, eval_max_date),
+                min_value=eval_min_date,
+                max_value=eval_max_date,
+                key="ens_eval_range",
+            )
+
+            # Normalize to (start, end)
+            if isinstance(eval_date_sel, tuple) and len(eval_date_sel) == 2:
+                eval_start, eval_end = eval_date_sel
+            else:
+                eval_start = eval_end = eval_date_sel
+
+            if eval_start > eval_end:
+                st.error("Evaluation start date is after end date.")
+            else:
+                if st.button("Run ensemble backtest", key="ens_backtest_btn"):
+                    total_calendar_days = (eval_end - eval_start).days + 1
+                    dates_with_data = 0
+                    total_hits_all = 0
+                    core_hits_total = 0
+                    core_mid_hits_total = 0
+
+                    detail_rows = []
+
+                    for offset in range(total_calendar_days):
+                        d = eval_start + timedelta(days=offset)
+                        mask = built_df["date"].dt.date == d
+                        if not mask.any():
+                            continue
+
+                        row = built_df.loc[mask].iloc[0]
+                        actual_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+                        actual_set = set()
+                        for x in actual_arr:
+                            try:
+                                v = int(x)
+                            except Exception:
+                                continue
+                            if 0 <= v <= 99:
+                                actual_set.add(v)
+
+                        if not actual_set:
+                            continue
+
+                        dates_with_data += 1
+
+                        scored_sorted = ens_score_numbers_for_date(
+                            ens_model,
+                            built_df,
+                            lottery_key=lottery_key,
+                            prob_mode=prob_mode,
+                            prob_weight_coeff=float(prob_weight),
+                            prediction_date=d,
+                        )
+
+                        top_list = scored_sorted[: int(top_n)]
+
+                        core_hits = 0
+                        mid_hits = 0
+                        edge_hits = 0
+
+                        for idx, item in enumerate(top_list):
+                            num = item["number"]
+                            if num in actual_set:
+                                if idx < core_count:
+                                    core_hits += 1
+                                elif idx < core_count + mid_count:
+                                    mid_hits += 1
+                                else:
+                                    edge_hits += 1
+
+                        day_total_hits = core_hits + mid_hits + edge_hits
+                        total_hits_all += day_total_hits
+                        core_hits_total += core_hits
+                        core_mid_hits_total += core_hits + mid_hits
+
+                        detail_rows.append(
+                            {
+                                "Date": d.isoformat(),
+                                "Day": row["dow_label"],
+                                "Actual": " ".join(str(n) for n in sorted(actual_set)),
+                                "Core Hits": core_hits,
+                                "Mid Hits": mid_hits,
+                                "Edge Hits": edge_hits,
+                                "Total Hits": day_total_hits,
+                            }
+                        )
+
+                    if dates_with_data == 0:
+                        st.warning("No dates with actual data found in this range for backtesting.")
+                    else:
+                        avg_hits_per_date = total_hits_all / dates_with_data
+                        core_hit_rate = (core_hits_total / dates_with_data) * 100.0
+                        core_mid_hit_rate = (core_mid_hits_total / dates_with_data) * 100.0
+                        any_tier_hit_rate = (total_hits_all / dates_with_data) * 100.0
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Dates in range", total_calendar_days)
+                        m2.metric("Dates with actual data", dates_with_data)
+                        m3.metric("Total hits (all tiers)", total_hits_all)
+                        m4.metric("Avg hits / date (past only)", f"{avg_hits_per_date:.2f}")
+
+                        n1, n2, n3, n4 = st.columns(4)
+                        n1.metric("Core hit rate", f"{core_hit_rate:.1f}%")
+                        n2.metric("Core+Mid hit rate", f"{core_mid_hit_rate:.1f}%")
+                        n3.metric("Any tier hit rate", f"{any_tier_hit_rate:.1f}%")
+                        n4.metric("Lottery", lottery_choice)
+
+                        if detail_rows:
+                            detail_df = pd.DataFrame(detail_rows)
+                            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                            csv_bytes = detail_df.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                "Download backtest details as CSV",
+                                data=csv_bytes,
+                                file_name="ensemble_backtest_details.csv",
+                                mime="text/csv",
+                            )
 
 # ==================== Global Date Range Lookup ==================== #
 
