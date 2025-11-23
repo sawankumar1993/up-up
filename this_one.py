@@ -1031,3 +1031,86 @@ with tab2:
                     f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
                     f"blend={prob_weight:.2f}."
                 )
+
+# ==================== Global Date Range Lookup ==================== #
+
+st.markdown("---")
+st.subheader("Date Range Lookup — WIN status for your Range/Custom")
+
+if built_df is None or built_df.empty:
+    st.info("Upload a CSV and click **Analyze & Prepare Data** first to use the lookup.")
+else:
+    # Use the same range/custom currently stored
+    rmin, rmax = st.session_state["range"]
+    custom_set = st.session_state["custom_set"]
+    custom_only = st.session_state["custom_only"]
+
+    min_date = built_df["date"].min().date()
+    max_date = built_df["date"].max().date()
+
+    st.caption(
+        f"Current settings → Range: `{rmin}-{rmax}`, "
+        f"Custom: {sorted(list(custom_set)) or 'None'}, "
+        f"Mode: {'Custom only' if custom_only else 'Range + Custom'}"
+    )
+
+    # Date range selector
+    date_selection = st.date_input(
+        "Select date range",
+        (min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        key="lookup_range",
+    )
+
+    # Normalize selection: can be a date or a (start, end) tuple
+    if isinstance(date_selection, tuple) and len(date_selection) == 2:
+        start_date, end_date = date_selection
+    else:
+        start_date = end_date = date_selection
+
+    if start_date > end_date:
+        st.error("Start date is after end date. Please fix the range.")
+    else:
+        if st.button("Run Lookup", key="lookup_btn"):
+            mask = (
+                (built_df["date"].dt.date >= start_date)
+                & (built_df["date"].dt.date <= end_date)
+            )
+            df_range = built_df.loc[mask].copy()
+
+            if df_range.empty:
+                st.warning("No records found in this date range.")
+            else:
+                lookup_table = pd.DataFrame(
+                    {
+                        "Date": df_range["date_key"],
+                        "Day": df_range["dow_label"],
+                        "DR": df_range["DR"].apply(format_nums),
+                        "DR Status": np.where(df_range["DR_win"], "WIN", "NOT WIN"),
+                        "FB": df_range["FB"].apply(format_nums),
+                        "FB Status": np.where(df_range["FB_win"], "WIN", "NOT WIN"),
+                        "GZ/GB": df_range["GZGB"].apply(format_nums),
+                        "GZ/GB Status": np.where(df_range["GZGB_win"], "WIN", "NOT WIN"),
+                        "GL": df_range["GL"].apply(format_nums),
+                        "GL Status": np.where(df_range["GL_win"], "WIN", "NOT WIN"),
+                        "Any WIN": np.where(df_range["any_win"], "WIN", "NOT WIN"),
+                    }
+                )
+
+                wins_in_range = int(df_range["any_win"].sum())
+                total_in_range = len(df_range)
+                st.metric(
+                    "WIN days in this range",
+                    f"{wins_in_range} / {total_in_range}",
+                )
+
+                st.dataframe(lookup_table, use_container_width=True, hide_index=True)
+
+                csv_bytes = lookup_table.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download lookup result as CSV",
+                    data=csv_bytes,
+                    file_name="date_range_lookup.csv",
+                    mime="text/csv",
+                )
