@@ -1,4 +1,3 @@
-
 import io
 import re
 from datetime import datetime, date, timedelta
@@ -353,7 +352,6 @@ def train_catboost_range(df: pd.DataFrame, rmin: int, rmax: int, custom_set: set
     )
     model.fit(X_train, y_train, eval_set=(X_test, y_test), verbose=False)
 
-
     proba_test = model.predict_proba(X_test)[:, 1]
     preds_test = (proba_test >= 0.5).astype(int)
 
@@ -468,7 +466,6 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     return model, metrics
 
 
-
 def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recency_mode: bool, ref_ts_ms: int):
     """
     Build weekly/day-of-month hit profiles using ONLY df_history (past data),
@@ -549,9 +546,6 @@ def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recenc
     }
 
 
-
-
-
 def ens_build_hit_dates(df_history: pd.DataFrame, lottery_key: str):
     """
     Build per-number hit timestamps from df_history ONLY (past data).
@@ -569,8 +563,6 @@ def ens_build_hit_dates(df_history: pd.DataFrame, lottery_key: str):
             if 0 <= num <= 99:
                 hit_dates[num].append(ts)
     return hit_dates
-
-
 
 
 def ens_score_numbers_for_date(
@@ -692,22 +684,21 @@ def ens_score_numbers_for_date(
     return scored_sorted
 
 
-
 # -------------------- Streamlit UI -------------------- #
 
 st.set_page_config(
-    page_title="ML Ensemble",
+    page_title="Lottery Tools — Range Wins + ML Ensemble (CatBoost)",
     layout="wide",
 )
 
-st.title("ML Ensemble")
+st.title("Lottery Tools — Range Wins + ML Ensemble (CatBoost)")
 
 st.markdown(
     """
     This Streamlit app mirrors your browser tools:
 
-    1. **Range Wins** — classical range/custom analysis for *Any WIN*.
-    2. **ML — Ensemble Forecast**
+    1. **Range Wins (per-date)** — classical range/custom analysis + CatBoost model for *Any WIN*.
+    2. **ML — Ensemble Number Prediction (0–99)** — CatBoost replacement for your TensorFlow ensemble,
        including:
        - **Probability Weight Strategy** (Weekly / Monthly / Both / Recency-weighted 3-month focus)
        - **ML / Probability blending** slider
@@ -722,9 +713,9 @@ with col_up_left:
     uploaded = st.file_uploader("Upload CSV (same format as calcnew.html)", type=["csv", "tsv"])
 
 with col_up_right:
-    rmin = st.number_input("Range min", min_value=0, max_value=99, value=0)
-    rmax = st.number_input("Range max", min_value=0, max_value=99, value=9)
-    custom_text = st.text_input("Custom numbers (comma/space separated)", placeholder="Type in your range")
+    rmin = st.number_input("Range min (0–99)", min_value=0, max_value=99, value=0)
+    rmax = st.number_input("Range max (0–99)", min_value=0, max_value=99, value=9)
+    custom_text = st.text_input("Custom numbers (comma/space separated)", placeholder="e.g. 5, 11, 44, 88")
     custom_only = st.checkbox("Custom only (ignore range)")
 
 if rmin > rmax:
@@ -1009,58 +1000,65 @@ with tab2:
             prob_mode = prob_mode_map[prob_mode_label]
 
             if st.button("Score numbers (Core / Mid / Edge)", key="ens_score_btn"):
-                with st.spinner("Scoring numbers 0–99 with ML + probability fusion..."):
-                    scored_sorted = ens_score_numbers_for_date(
-                        ens_model,
-                        built_df,
-                        lottery_key=lottery_key,
-                        prob_mode=prob_mode,
-                        prob_weight_coeff=float(prob_weight),
-                        prediction_date=pred_date,
+                # Use only history up to (but not including) the prediction date
+                history_mask = built_df["date"] < pd.to_datetime(pred_date)
+                history_df = built_df.loc[history_mask].copy()
+
+                if history_df.empty:
+                    st.error("No historical data available before this prediction date.")
+                else:
+                    with st.spinner("Scoring numbers 0–99 with ML + probability fusion..."):
+                        scored_sorted = ens_score_numbers_for_date(
+                            ens_model,
+                            history_df,
+                            lottery_key=lottery_key,
+                            prob_mode=prob_mode,
+                            prob_weight_coeff=float(prob_weight),
+                            prediction_date=pred_date,
+                        )
+
+                    top_list = scored_sorted[: int(top_n)]
+                    rows = []
+                    for idx, item in enumerate(top_list):
+                        num = item["number"]
+                        ml_score = item["ml_score"]
+                        prob_score = item["prob_score"]
+                        final_score = item["final_score"]
+
+                        if idx < core_count:
+                            tier = "Core"
+                        elif idx < core_count + mid_count:
+                            tier = "Mid"
+                        else:
+                            tier = "Edge"
+
+                        rows.append(
+                            {
+                                "Rank": idx + 1,
+                                "Number": num,
+                                "Tier": tier,
+                                "Final Score": round(final_score, 6),
+                                "ML Score": round(ml_score, 6),
+                                "Prob Score": round(prob_score, 6),
+                            }
+                        )
+
+                    result_df = pd.DataFrame(rows)
+                    st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+                    csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download Top-N (Core/Mid/Edge) as CSV",
+                        data=csv_bytes,
+                        file_name="ml_ensemble_top_numbers.csv",
+                        mime="text/csv",
                     )
 
-                top_list = scored_sorted[: int(top_n)]
-                rows = []
-                for idx, item in enumerate(top_list):
-                    num = item["number"]
-                    ml_score = item["ml_score"]
-                    prob_score = item["prob_score"]
-                    final_score = item["final_score"]
-
-                    if idx < core_count:
-                        tier = "Core"
-                    elif idx < core_count + mid_count:
-                        tier = "Mid"
-                    else:
-                        tier = "Edge"
-
-                    rows.append(
-                        {
-                            "Rank": idx + 1,
-                            "Number": num,
-                            "Tier": tier,
-                            "Final Score": round(final_score, 6),
-                            "ML Score": round(ml_score, 6),
-                            "Prob Score": round(prob_score, 6),
-                        }
+                    st.success(
+                        f"Scored numbers 0–99 for {pred_date.isoformat()} "
+                        f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
+                        f"blend={prob_weight:.2f}."
                     )
-
-                result_df = pd.DataFrame(rows)
-                st.dataframe(result_df, use_container_width=True, hide_index=True)
-
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download Top-N (Core/Mid/Edge) as CSV",
-                    data=csv_bytes,
-                    file_name="ml_ensemble_top_numbers.csv",
-                    mime="text/csv",
-                )
-
-                st.success(
-                    f"Scored numbers 0–99 for {pred_date.isoformat()} "
-                    f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
-                    f"blend={prob_weight:.2f}."
-                )
 
         # 3) Backtest ensemble vs actual for a date range
         if ens_model is not None:
@@ -1116,11 +1114,18 @@ with tab2:
                         if not actual_set:
                             continue
 
+                        # History = all draws strictly before this evaluation date
+                        history_mask = built_df["date"].dt.date < d
+                        history_df = built_df.loc[history_mask].copy()
+                        if history_df.empty:
+                            # No history before this date → skip it
+                            continue
+
                         dates_with_data += 1
 
                         scored_sorted = ens_score_numbers_for_date(
                             ens_model,
-                            built_df,
+                            history_df,
                             lottery_key=lottery_key,
                             prob_mode=prob_mode,
                             prob_weight_coeff=float(prob_weight),
@@ -1274,13 +1279,3 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
-
-
-
-
-
-
-
-
-
-
