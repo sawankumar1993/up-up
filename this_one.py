@@ -468,8 +468,12 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     return model, metrics
 
 
-def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: bool):
-    now_ts = int(datetime.utcnow().timestamp() * 1000)
+
+def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recency_mode: bool, ref_ts_ms: int):
+    """
+    Build weekly/day-of-month hit profiles using ONLY df_history (past data),
+    with optional recency weighting relative to ref_ts_ms (ms since epoch).
+    """
     day_ms = 24 * 60 * 60 * 1000
     lam = 0.02
 
@@ -478,7 +482,7 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
     tot_dow = np.zeros(7, dtype=float)
     tot_dom = np.zeros(32, dtype=float)
 
-    df_sorted = df.sort_values("date")
+    df_sorted = df_history.sort_values("date")
     for _, row in df_sorted.iterrows():
         key = row["date_key"]
         parts = str(key).split("-")
@@ -497,8 +501,11 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
             continue
 
         ts = int(row["timestamp"] * 1000)
-        age_days = max(0.0, (now_ts - ts) / day_ms)
-        w = float(np.exp(-lam * age_days)) if recency_mode else 1.0
+        if recency_mode:
+            age_days = max(0.0, (ref_ts_ms - ts) / day_ms)
+            w = float(np.exp(-lam * age_days))
+        else:
+            w = 1.0
 
         tot_dow[dow_index] += w
         tot_dom[dd] += w
@@ -540,6 +547,9 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
         "max_weekly": max_weekly,
         "max_monthly": max_monthly,
     }
+
+
+
 
 
 def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
@@ -1246,6 +1256,7 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
 
 
