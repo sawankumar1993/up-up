@@ -693,9 +693,9 @@ with col_up_left:
     uploaded = st.file_uploader("Upload CSV (same format as calcnew.html)", type=["csv", "tsv"])
 
 with col_up_right:
-    rmin = st.number_input("Range min (0–99)", min_value=0, max_value=99, value=0)
-    rmax = st.number_input("Range max (0–99)", min_value=0, max_value=99, value=9)
-    custom_text = st.text_input("Custom numbers (comma/space separated)", placeholder="e.g. 5, 11, 44, 88")
+    rmin = st.number_input("Range min", min_value=0, max_value=99, value=0)
+    rmax = st.number_input("Range max", min_value=0, max_value=99, value=9)
+    custom_text = st.text_input("Custom numbers (comma/space separated)", placeholder="Type in your range")
     custom_only = st.checkbox("Custom only (ignore range)")
 
 if rmin > rmax:
@@ -1245,5 +1245,6 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
 
