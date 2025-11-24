@@ -667,11 +667,11 @@ def ens_score_numbers_for_date(
 # -------------------- Streamlit UI -------------------- #
 
 st.set_page_config(
-    page_title="Lottery Tools — Range Wins + ML Ensemble (CatBoost)",
+    page_title="ML Ensemble",
     layout="wide",
 )
 
-st.title("Lottery Tools — Range Wins + ML Ensemble (CatBoost)")
+st.title("ML Ensemble")
 
 st.markdown(
     """
@@ -1245,3 +1245,4 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
