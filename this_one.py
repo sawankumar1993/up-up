@@ -342,16 +342,6 @@ def train_catboost_range(df: pd.DataFrame, rmin: int, rmax: int, custom_set: set
     y = df["any_win"].astype(int)
     X_train, X_test, y_train, y_test = chrono_split_dates(feats, y, train_ratio=train_ratio)
 
-    # ----- NEW: compute class weights for hits (1) vs non-hits (0) -----
-    pos_count = int(y_train.sum())
-    neg_count = int(len(y_train) - pos_count)
-    if pos_count > 0 and neg_count > 0:
-        pos_weight = neg_count / pos_count  # e.g. if 10x more negatives → weight positives 10x
-        class_weights = [1.0, float(pos_weight)]  # [weight_for_class_0, weight_for_class_1]
-    else:
-        class_weights = None
-    # -------------------------------------------------------------------
-
     model = CatBoostClassifier(
         depth=6,
         learning_rate=0.1,
@@ -360,7 +350,6 @@ def train_catboost_range(df: pd.DataFrame, rmin: int, rmax: int, custom_set: set
         eval_metric="AUC",
         random_seed=42,
         verbose=False,
-        class_weights=class_weights,     # <-- NEW ARG
     )
     model.fit(X_train, y_train, eval_set=(X_test, y_test), verbose=False)
 
@@ -446,16 +435,6 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     X_val = X[n_train:]
     y_val = y[n_train:]
 
-    # ----- NEW: compute class weights here as well -----
-    pos_count = int(y_train.sum())
-    neg_count = int(len(y_train) - pos_count)
-    if pos_count > 0 and neg_count > 0:
-        pos_weight = neg_count / pos_count
-        class_weights = [1.0, float(pos_weight)]
-    else:
-        class_weights = None
-    # ---------------------------------------------------
-
     model = CatBoostClassifier(
         depth=6,
         learning_rate=0.08,
@@ -464,7 +443,6 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
         eval_metric="AUC",
         random_seed=42,
         verbose=False,
-        class_weights=class_weights,     # <-- NEW ARG
     )
     model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
 
@@ -1268,6 +1246,7 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
 
 
