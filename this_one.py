@@ -1,5 +1,6 @@
 import io
 import re
+import math
 from datetime import datetime, date, timedelta
 
 import numpy as np
@@ -385,10 +386,48 @@ def make_single_features_for_date_range(target_date: date, rmin: int, rmax: int,
 
 # -------------------- ML Ensemble 0–99 (CatBoost replacement) -------------------- #
 
-def ens_build_dataset(df: pd.DataFrame, lottery_key: str):
+def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
+    """
+    Build per-number hit timestamp lists (ms since epoch), sorted by time.
+    """
+    hit_dates = [[] for _ in range(100)]
+    df_sorted = df.sort_values("date")
+    for _, row in df_sorted.iterrows():
+        ts = int(row["timestamp"] * 1000)
+        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+        for raw in nums_arr:
+            try:
+                num = int(raw)
+            except ValueError:
+                continue
+            if 0 <= num <= 99:
+                hit_dates[num].append(ts)
+    return hit_dates
+
+
+def ens_build_dataset(
+    df: pd.DataFrame,
+    lottery_key: str,
+    recency_half_life: float = 30.0,
+    recency_window_days: float = 90.0,
+):
+    """
+    Build leak-free per-(date, number) training dataset with recency features.
+    For each (date, num) we only use hits strictly BEFORE that date.
+    """
     xs = []
     ys = []
-    df_sorted = df.sort_values("date")
+
+    df_sorted = df.sort_values("date").reset_index(drop=True)
+    hit_dates = ens_build_hit_dates(df_sorted, lottery_key)
+
+    day_ms = 24 * 60 * 60 * 1000
+    max_days_norm = max(recency_window_days * 2.0, 365.0)
+    if recency_half_life > 0:
+        gamma = math.log(2.0) / float(recency_half_life)
+    else:
+        gamma = 0.0
+
     for _, row in df_sorted.iterrows():
         key = row["date_key"]
         parts = str(key).split("-")
@@ -398,29 +437,84 @@ def ens_build_dataset(df: pd.DataFrame, lottery_key: str):
             dd = int(parts[2])
         except ValueError:
             continue
+
         dow_idx = int(row["dow_js_idx"])
         nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
         num_set = set(int(n) for n in nums_arr if 0 <= int(n) <= 99)
 
+        today_ts = int(row["timestamp"] * 1000)
+
         x_base1 = dow_idx / 6.0
         x_base2 = dd / 31.0
+
         for num in range(100):
+            # Leak-free recency stats for this (date, num)
+            ts_list = hit_dates[num]
+            last_age_days = None
+            count_window = 0
+
+            if ts_list:
+                for ts in reversed(ts_list):
+                    if ts >= today_ts:
+                        continue  # skip same-day/future hits
+                    age_days = (today_ts - ts) / day_ms
+                    if last_age_days is None:
+                        last_age_days = age_days
+                    if age_days <= recency_window_days:
+                        count_window += 1
+                    else:
+                        break
+
+            if last_age_days is None:
+                recency_raw = 0.0
+                days_norm = 1.0  # "very far in the past / never"
+            else:
+                recency_raw = math.exp(-gamma * last_age_days) if gamma > 0 else 0.0
+                days_norm = min(last_age_days, max_days_norm) / max_days_norm
+
+            freq_recent = count_window / recency_window_days
+
             x3 = num / 99.0
-            y = 1 if num in num_set else 0
-            xs.append([x_base1, x_base2, x3])
-            ys.append(y)
+            x = [
+                x_base1,
+                x_base2,
+                x3,
+                recency_raw,
+                freq_recent,
+                days_norm,
+            ]
+            y_val = 1 if num in num_set else 0
+            xs.append(x)
+            ys.append(y_val)
 
     if not xs:
         return None, None
+
     X = np.array(xs, dtype=np.float32)
     y = np.array(ys, dtype=np.int32)
     return X, y
 
 
-def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 0.8):
+def ens_train_catboost(
+    df: pd.DataFrame,
+    lottery_key: str,
+    train_ratio: float = 0.8,
+    recency_half_life: float = 30.0,
+    recency_window_days: float = 90.0,
+):
+    """
+    Train CatBoost on per-(date, num) dataset, with:
+    - leak-free recency features
+    - class weighting for hits
+    """
     from sklearn.metrics import accuracy_score, roc_auc_score
 
-    X, y = ens_build_dataset(df, lottery_key)
+    X, y = ens_build_dataset(
+        df,
+        lottery_key,
+        recency_half_life=recency_half_life,
+        recency_window_days=recency_window_days,
+    )
     if X is None:
         raise ValueError("No samples built for ensemble model.")
 
@@ -433,6 +527,14 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     X_val = X[n_train:]
     y_val = y[n_train:]
 
+    # Class weighting to favour hits (positive class)
+    pos_count = int(y_train.sum())
+    neg_count = int(len(y_train) - pos_count)
+    if pos_count > 0 and neg_count > 0:
+        scale_pos_weight = float(neg_count) / float(pos_count)
+    else:
+        scale_pos_weight = 1.0
+
     model = CatBoostClassifier(
         depth=6,
         learning_rate=0.08,
@@ -441,6 +543,7 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
         eval_metric="AUC",
         random_seed=42,
         verbose=False,
+        scale_pos_weight=scale_pos_weight,
     )
     model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
 
@@ -462,15 +565,18 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
         "n_val": int(n - n_train),
         "val_accuracy": val_acc,
         "val_auc": val_auc,
+        "pos_frac_train": float(pos_count) / float(len(y_train)) if len(y_train) > 0 else float("nan"),
+        "scale_pos_weight": scale_pos_weight,
     }
     return model, metrics
 
 
-def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recency_mode: bool, ref_ts_ms: int):
+def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: bool):
     """
-    Build weekly/day-of-month hit profiles using ONLY df_history (past data),
-    with optional recency weighting relative to ref_ts_ms (ms since epoch).
+    Weekly / monthly probability profiles.
+    recency_mode=True -> exponential decay by age; False -> uniform.
     """
+    now_ts = int(datetime.utcnow().timestamp() * 1000)
     day_ms = 24 * 60 * 60 * 1000
     lam = 0.02
 
@@ -479,7 +585,7 @@ def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recenc
     tot_dow = np.zeros(7, dtype=float)
     tot_dom = np.zeros(32, dtype=float)
 
-    df_sorted = df_history.sort_values("date")
+    df_sorted = df.sort_values("date")
     for _, row in df_sorted.iterrows():
         key = row["date_key"]
         parts = str(key).split("-")
@@ -499,7 +605,7 @@ def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recenc
 
         ts = int(row["timestamp"] * 1000)
         if recency_mode:
-            age_days = max(0.0, (ref_ts_ms - ts) / day_ms)
+            age_days = max(0.0, (now_ts - ts) / day_ms)
             w = float(np.exp(-lam * age_days))
         else:
             w = 1.0
@@ -546,61 +652,38 @@ def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recenc
     }
 
 
-def ens_build_hit_dates(df_history: pd.DataFrame, lottery_key: str):
-    """
-    Build per-number hit timestamps from df_history ONLY (past data).
-    """
-    hit_dates = [[] for _ in range(100)]
-    df_sorted = df_history.sort_values("date")
-    for _, row in df_sorted.iterrows():
-        ts = int(row["timestamp"] * 1000)
-        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
-        for raw in nums_arr:
-            try:
-                num = int(raw)
-            except ValueError:
-                continue
-            if 0 <= num <= 99:
-                hit_dates[num].append(ts)
-    return hit_dates
-
-
 def ens_score_numbers_for_date(
     model,
-    df_history: pd.DataFrame,
+    df: pd.DataFrame,
     lottery_key: str,
     prob_mode: str,
     prob_weight_coeff: float,
     prediction_date: date,
+    recency_half_life: float = 30.0,
+    recency_window_days: float = 90.0,
+    recency_alpha: float = 0.7,
 ):
     """
-    Score numbers 0–99 for a given prediction_date using ONLY df_history
-    (all rows strictly before or up to that date, depending on how caller slices).
+    Score 0–99 for a given prediction date using:
+    - CatBoost ensemble (ML)
+    - Weekly / Monthly / Recency probability profiles (leak-free)
     """
-    if df_history.empty:
-        raise ValueError("No history data available for scoring.")
+    if df.empty:
+        raise ValueError("No data loaded.")
 
-    # Prediction date and reference timestamp for recency
-    dt = datetime(prediction_date.year, prediction_date.month, prediction_date.day)
-    ref_ts_ms = int(dt.timestamp() * 1000)
-
-    # Build probability profiles **from history only**
-    use_recency_profiles = (prob_mode == "recent")
-    profiles = ens_build_number_profiles(
-        df_history,
-        lottery_key,
-        recency_mode=use_recency_profiles,
-        ref_ts_ms=ref_ts_ms,
-    )
+    # Probability profiles (weekly/monthly) use *history* df, already trimmed by caller.
+    use_recency_profiles = prob_mode in ("weekly", "monthly", "both")
+    profiles = ens_build_number_profiles(df, lottery_key, recency_mode=use_recency_profiles)
     weekly_profile = profiles["weekly_profile"]
     monthly_profile = profiles["monthly_profile"]
     max_weekly = profiles["max_weekly"]
     max_monthly = profiles["max_monthly"]
 
-    # Recency hit dates (for 'recent' mode), from history only
-    hit_dates = ens_build_hit_dates(df_history, lottery_key)
+    # Recency hit dates (for 'recent' mode) computed from history df only
+    hit_dates = ens_build_hit_dates(df, lottery_key)
 
-    # ML scores for this date (same as before)
+    # ML scores for this date
+    dt = datetime(prediction_date.year, prediction_date.month, prediction_date.day)
     dow_index = (dt.weekday() + 1) % 7  # JS-style 0..6, Sun=0
     dd = dt.day
 
@@ -609,60 +692,117 @@ def ens_score_numbers_for_date(
     feats = []
     for num in range(100):
         x3 = num / 99.0
-        feats.append([x1, x2, x3])
+        # Recency features (same formulation as training, but strictly using history df)
+        day_ms = 24 * 60 * 60 * 1000
+        today_ts = int(dt.timestamp() * 1000)
+        if recency_half_life > 0:
+            gamma = math.log(2.0) / float(recency_half_life)
+        else:
+            gamma = 0.0
+        max_days_norm = max(recency_window_days * 2.0, 365.0)
+
+        ts_list = hit_dates[num]
+        last_age_days = None
+        count_window = 0
+        if ts_list:
+            for ts in reversed(ts_list):
+                if ts >= today_ts:
+                    continue
+                age_days = (today_ts - ts) / day_ms
+                if last_age_days is None:
+                    last_age_days = age_days
+                if age_days <= recency_window_days:
+                    count_window += 1
+                else:
+                    break
+
+        if last_age_days is None:
+            recency_raw = 0.0
+            days_norm = 1.0
+        else:
+            recency_raw = math.exp(-gamma * last_age_days) if gamma > 0 else 0.0
+            days_norm = min(last_age_days, max_days_norm) / max_days_norm
+
+        freq_recent = count_window / recency_window_days
+
+        feats.append([x1, x2, x3, recency_raw, freq_recent, days_norm])
+
     X_pred = np.array(feats, dtype=np.float32)
     ml_probs = model.predict_proba(X_pred)[:, 1]
 
-    day_ms = 24 * 60 * 60 * 1000
-    today_ts = ref_ts_ms
-    window_days = 90.0
+    # For recency-weighted mode, we now build a sharper recency profile:
+    # - exponential half-life
+    # - per-date max-normalisation
+    # - alpha/beta weighting between "last hit" and "short-window frequency".
+    if prob_mode == "recent":
+        day_ms = 24 * 60 * 60 * 1000
+        today_ts = int(dt.timestamp() * 1000)
+        if recency_half_life > 0:
+            gamma = math.log(2.0) / float(recency_half_life)
+        else:
+            gamma = 0.0
+
+        rec_raw_all = np.zeros(100, dtype=float)
+        freq_all = np.zeros(100, dtype=float)
+
+        for num in range(100):
+            ts_list = hit_dates[num]
+            last_age_days = None
+            count_window = 0
+            if ts_list:
+                for ts in reversed(ts_list):
+                    if ts >= today_ts:
+                        continue
+                    age_days = (today_ts - ts) / day_ms
+                    if last_age_days is None:
+                        last_age_days = age_days
+                    if age_days <= recency_window_days:
+                        count_window += 1
+                    else:
+                        break
+
+            if last_age_days is not None and gamma > 0:
+                rec_raw_all[num] = math.exp(-gamma * last_age_days)
+            else:
+                rec_raw_all[num] = 0.0
+
+            freq_all[num] = count_window / recency_window_days
+
+        max_rec = float(rec_raw_all.max()) if rec_raw_all.size > 0 else 0.0
+        max_freq = float(freq_all.max()) if freq_all.size > 0 else 0.0
 
     scored = []
     for num in range(100):
         ml_score = float(ml_probs[num])
 
-        w_week = 0.0
-        w_month = 0.0
-        norm_week = 0.0
-        norm_month = 0.0
-
-        if max_weekly > 0.0:
-            w_week = weekly_profile[num, dow_index]
-            norm_week = w_week / max_weekly
-        if max_monthly > 0.0 and 1 <= dd <= 31:
-            w_month = monthly_profile[num, dd]
-            norm_month = w_month / max_monthly
-
+        w_num = 0.0
         if prob_mode == "weekly":
-            w_num = norm_week
+            if max_weekly > 0.0:
+                w_week = weekly_profile[num, dow_index]
+                w_num = w_week / max_weekly
         elif prob_mode == "monthly":
-            w_num = norm_month
+            if max_monthly > 0.0 and 1 <= dd <= 31:
+                w_month = monthly_profile[num, dd]
+                w_num = w_month / max_monthly
         elif prob_mode == "both":
             vals = []
-            if norm_week > 0:
-                vals.append(norm_week)
-            if norm_month > 0:
-                vals.append(norm_month)
+            if max_weekly > 0.0:
+                vals.append(weekly_profile[num, dow_index] / max_weekly)
+            if max_monthly > 0.0 and 1 <= dd <= 31:
+                vals.append(monthly_profile[num, dd] / max_monthly)
             w_num = sum(vals) / len(vals) if vals else 0.0
         elif prob_mode == "recent":
-            hits = hit_dates[num]
-            rec_score = 0.0
-            if hits:
-                last_ts = hits[-1]
-                if last_ts <= today_ts:
-                    rec_days = (today_ts - last_ts) / day_ms
-                    rec_score = 1.0 / (1.0 + rec_days)
-
-            count = 0
-            for ts in reversed(hits):
-                age_days = (today_ts - ts) / day_ms
-                if age_days < 0:
-                    continue
-                if age_days > window_days:
-                    break
-                count += 1
-            freq3 = count / window_days
-            w_num = rec_score + freq3
+            # Normalised recency + short-window frequency
+            if max_rec > 0.0:
+                r_norm = rec_raw_all[num] / max_rec
+            else:
+                r_norm = 0.0
+            if max_freq > 0.0:
+                f_norm = freq_all[num] / max_freq
+            else:
+                f_norm = 0.0
+            beta = 1.0 - recency_alpha
+            w_num = recency_alpha * r_norm + beta * f_norm
         else:
             w_num = 0.0
 
@@ -925,6 +1065,45 @@ with tab2:
             "*Default 0.4 = 60% ML + 40% probability, exactly matching your browser slider semantics.*"
         )
 
+        # Recency-specific advanced settings
+        recency_half_life = 30.0
+        recency_window_days = 90.0
+        recency_alpha = 0.7
+        if prob_mode_label == "Recency-weighted (3-month focus)":
+            with st.expander("Recency settings (advanced)", expanded=False):
+                recency_half_life = st.number_input(
+                    "Recency half-life (days)",
+                    min_value=1.0,
+                    max_value=365.0,
+                    value=30.0,
+                    step=1.0,
+                    key="rec_half_life",
+                )
+                recency_window_days = st.number_input(
+                    "Recency window (days)",
+                    min_value=7.0,
+                    max_value=365.0,
+                    value=90.0,
+                    step=1.0,
+                    key="rec_window_days",
+                )
+                recency_alpha = st.slider(
+                    "Recency weight α (recency vs frequency)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.7,
+                    step=0.05,
+                    key="rec_alpha",
+                )
+
+        prob_mode_map = {
+            "Weekly only": "weekly",
+            "Monthly only": "monthly",
+            "Weekly + Monthly (avg)": "both",
+            "Recency-weighted (3-month focus)": "recent",
+        }
+        prob_mode = prob_mode_map[prob_mode_label]
+
         st.markdown("---")
         st.markdown("**Core / Mid / Edge sizing** — `Core + Mid ≤ Top N` (Edge = remaining).")
         c1, c2, c3 = st.columns(3)
@@ -957,7 +1136,13 @@ with tab2:
 
         if st.button("Train Ensemble Model (CatBoost)", key="ens_train_btn"):
             with st.spinner("Training CatBoost ensemble model (0–99)..."):
-                model, metrics = ens_train_catboost(built_df, lottery_key, train_ratio=ens_train_ratio)
+                model, metrics = ens_train_catboost(
+                    built_df,
+                    lottery_key,
+                    train_ratio=ens_train_ratio,
+                    recency_half_life=recency_half_life,
+                    recency_window_days=recency_window_days,
+                )
                 st.session_state["ens_model"] = model
                 st.session_state["ens_metrics"] = metrics
 
@@ -971,7 +1156,9 @@ with tab2:
                 f"{m['val_accuracy']*100:.2f}%" if not np.isnan(m["val_accuracy"]) else "NA",
             )
             st.caption(
-                f"AUC: {m['val_auc']:.4f}" if not np.isnan(m["val_auc"]) else "AUC: NA"
+                f"AUC: {m['val_auc']:.4f}  •  "
+                f"Pos frac (train): {m['pos_frac_train']:.4f}  •  "
+                f"scale_pos_weight: {m['scale_pos_weight']:.2f}"
             )
 
         ens_model = st.session_state.get("ens_model")
@@ -991,21 +1178,13 @@ with tab2:
                 key="ens_pred_date",
             )
 
-            prob_mode_map = {
-                "Weekly only": "weekly",
-                "Monthly only": "monthly",
-                "Weekly + Monthly (avg)": "both",
-                "Recency-weighted (3-month focus)": "recent",
-            }
-            prob_mode = prob_mode_map[prob_mode_label]
-
             if st.button("Score numbers (Core / Mid / Edge)", key="ens_score_btn"):
-                # Use only history up to (but not including) the prediction date
-                history_mask = built_df["date"] < pd.to_datetime(pred_date)
+                # Use only history up to the day *before* prediction_date (leak-free)
+                history_mask = built_df["date"].dt.date < pred_date
                 history_df = built_df.loc[history_mask].copy()
 
                 if history_df.empty:
-                    st.error("No historical data available before this prediction date.")
+                    st.warning("No historical data before this prediction date.")
                 else:
                     with st.spinner("Scoring numbers 0–99 with ML + probability fusion..."):
                         scored_sorted = ens_score_numbers_for_date(
@@ -1015,6 +1194,9 @@ with tab2:
                             prob_mode=prob_mode,
                             prob_weight_coeff=float(prob_weight),
                             prediction_date=pred_date,
+                            recency_half_life=recency_half_life,
+                            recency_window_days=recency_window_days,
+                            recency_alpha=recency_alpha,
                         )
 
                     top_list = scored_sorted[: int(top_n)]
@@ -1060,7 +1242,7 @@ with tab2:
                         f"blend={prob_weight:.2f}."
                     )
 
-        # 3) Backtest ensemble vs actual for a date range
+        # 3) Backtest ensemble vs actual for a date range (leak-free)
         if ens_model is not None:
             st.markdown("---")
             st.subheader("3) Backtest ensemble vs actual results (date range)")
@@ -1096,11 +1278,13 @@ with tab2:
 
                     for offset in range(total_calendar_days):
                         d = eval_start + timedelta(days=offset)
-                        mask = built_df["date"].dt.date == d
-                        if not mask.any():
+
+                        # Actual results on day d (using full df)
+                        mask_day = built_df["date"].dt.date == d
+                        if not mask_day.any():
                             continue
 
-                        row = built_df.loc[mask].iloc[0]
+                        row = built_df.loc[mask_day].iloc[0]
                         actual_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
                         actual_set = set()
                         for x in actual_arr:
@@ -1114,11 +1298,10 @@ with tab2:
                         if not actual_set:
                             continue
 
-                        # History = all draws strictly before this evaluation date
+                        # History up to the day *before* d
                         history_mask = built_df["date"].dt.date < d
                         history_df = built_df.loc[history_mask].copy()
                         if history_df.empty:
-                            # No history before this date → skip it
                             continue
 
                         dates_with_data += 1
@@ -1130,6 +1313,9 @@ with tab2:
                             prob_mode=prob_mode,
                             prob_weight_coeff=float(prob_weight),
                             prediction_date=d,
+                            recency_half_life=recency_half_life,
+                            recency_window_days=recency_window_days,
+                            recency_alpha=recency_alpha,
                         )
 
                         top_list = scored_sorted[: int(top_n)]
