@@ -677,8 +677,8 @@ st.markdown(
     """
     This Streamlit app mirrors your browser tools:
 
-    1. **Range Wins (per-date)** — classical range/custom analysis + CatBoost model for *Any WIN*.
-    2. **ML — Ensemble Number Prediction (0–99)** — CatBoost replacement for your TensorFlow ensemble,
+    1. **Range Wins** — classical range/custom analysis for *Any WIN*.
+    2. **ML — Ensemble Forecast**
        including:
        - **Probability Weight Strategy** (Weekly / Monthly / Both / Recency-weighted 3-month focus)
        - **ML / Probability blending** slider
@@ -1245,4 +1245,5 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
