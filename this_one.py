@@ -552,9 +552,12 @@ def ens_build_number_profiles(df_history: pd.DataFrame, lottery_key: str, recenc
 
 
 
-def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
+def ens_build_hit_dates(df_history: pd.DataFrame, lottery_key: str):
+    """
+    Build per-number hit timestamps from df_history ONLY (past data).
+    """
     hit_dates = [[] for _ in range(100)]
-    df_sorted = df.sort_values("date")
+    df_sorted = df_history.sort_values("date")
     for _, row in df_sorted.iterrows():
         ts = int(row["timestamp"] * 1000)
         nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
@@ -568,30 +571,44 @@ def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
     return hit_dates
 
 
+
+
 def ens_score_numbers_for_date(
     model,
-    df: pd.DataFrame,
+    df_history: pd.DataFrame,
     lottery_key: str,
     prob_mode: str,
     prob_weight_coeff: float,
     prediction_date: date,
 ):
-    if df.empty:
-        raise ValueError("No data loaded.")
+    """
+    Score numbers 0–99 for a given prediction_date using ONLY df_history
+    (all rows strictly before or up to that date, depending on how caller slices).
+    """
+    if df_history.empty:
+        raise ValueError("No history data available for scoring.")
 
-    # Build probability profiles
+    # Prediction date and reference timestamp for recency
+    dt = datetime(prediction_date.year, prediction_date.month, prediction_date.day)
+    ref_ts_ms = int(dt.timestamp() * 1000)
+
+    # Build probability profiles **from history only**
     use_recency_profiles = (prob_mode == "recent")
-    profiles = ens_build_number_profiles(df, lottery_key, recency_mode=use_recency_profiles)
+    profiles = ens_build_number_profiles(
+        df_history,
+        lottery_key,
+        recency_mode=use_recency_profiles,
+        ref_ts_ms=ref_ts_ms,
+    )
     weekly_profile = profiles["weekly_profile"]
     monthly_profile = profiles["monthly_profile"]
     max_weekly = profiles["max_weekly"]
     max_monthly = profiles["max_monthly"]
 
-    # Recency hit dates (for 'recent' mode)
-    hit_dates = ens_build_hit_dates(df, lottery_key)
+    # Recency hit dates (for 'recent' mode), from history only
+    hit_dates = ens_build_hit_dates(df_history, lottery_key)
 
-    # ML scores for this date
-    dt = datetime(prediction_date.year, prediction_date.month, prediction_date.day)
+    # ML scores for this date (same as before)
     dow_index = (dt.weekday() + 1) % 7  # JS-style 0..6, Sun=0
     dd = dt.day
 
@@ -605,7 +622,7 @@ def ens_score_numbers_for_date(
     ml_probs = model.predict_proba(X_pred)[:, 1]
 
     day_ms = 24 * 60 * 60 * 1000
-    today_ts = int(dt.timestamp() * 1000)
+    today_ts = ref_ts_ms
     window_days = 90.0
 
     scored = []
@@ -673,6 +690,7 @@ def ens_score_numbers_for_date(
 
     scored_sorted = sorted(scored, key=lambda r: r["final_score"], reverse=True)
     return scored_sorted
+
 
 
 # -------------------- Streamlit UI -------------------- #
@@ -1256,6 +1274,7 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
 
 
