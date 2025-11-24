@@ -435,9 +435,9 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     y_val = y[n_train:]
 
     model = CatBoostClassifier(
-        depth=6,
-        learning_rate=0.08,
-        iterations=400,
+        depth=4,
+        learning_rate=0.05,
+        iterations=600,
         loss_function="Logloss",
         eval_metric="AUC",
         random_seed=42,
@@ -1245,6 +1245,7 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
 
 
