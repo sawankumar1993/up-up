@@ -343,9 +343,9 @@ def train_catboost_range(df: pd.DataFrame, rmin: int, rmax: int, custom_set: set
     X_train, X_test, y_train, y_test = chrono_split_dates(feats, y, train_ratio=train_ratio)
 
     model = CatBoostClassifier(
-        depth=6,
+        depth=4,
         learning_rate=0.1,
-        iterations=400,
+        iterations=600,
         loss_function="Logloss",
         eval_metric="AUC",
         random_seed=42,
@@ -1245,6 +1245,7 @@ else:
                     file_name="date_range_lookup.csv",
                     mime="text/csv",
                 )
+
 
 
 
