@@ -1,5 +1,6 @@
 import io
 import re
+import math
 from datetime import datetime, date, timedelta
 
 import numpy as np
@@ -385,10 +386,48 @@ def make_single_features_for_date_range(target_date: date, rmin: int, rmax: int,
 
 # -------------------- ML Ensemble 0–99 (CatBoost replacement) -------------------- #
 
-def ens_build_dataset(df: pd.DataFrame, lottery_key: str):
+def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
+    """
+    Build per-number hit timestamp lists (ms since epoch), sorted by time.
+    """
+    hit_dates = [[] for _ in range(100)]
+    df_sorted = df.sort_values("date")
+    for _, row in df_sorted.iterrows():
+        ts = int(row["timestamp"] * 1000)
+        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
+        for raw in nums_arr:
+            try:
+                num = int(raw)
+            except ValueError:
+                continue
+            if 0 <= num <= 99:
+                hit_dates[num].append(ts)
+    return hit_dates
+
+
+def ens_build_dataset(
+    df: pd.DataFrame,
+    lottery_key: str,
+    recency_half_life: float = 30.0,
+    recency_window_days: float = 90.0,
+):
+    """
+    Build leak-free per-(date, number) training dataset with recency features.
+    For each (date, num) we only use hits strictly BEFORE that date.
+    """
     xs = []
     ys = []
-    df_sorted = df.sort_values("date")
+
+    df_sorted = df.sort_values("date").reset_index(drop=True)
+    hit_dates = ens_build_hit_dates(df_sorted, lottery_key)
+
+    day_ms = 24 * 60 * 60 * 1000
+    max_days_norm = max(recency_window_days * 2.0, 365.0)
+    if recency_half_life > 0:
+        gamma = math.log(2.0) / float(recency_half_life)
+    else:
+        gamma = 0.0
+
     for _, row in df_sorted.iterrows():
         key = row["date_key"]
         parts = str(key).split("-")
@@ -398,29 +437,84 @@ def ens_build_dataset(df: pd.DataFrame, lottery_key: str):
             dd = int(parts[2])
         except ValueError:
             continue
+
         dow_idx = int(row["dow_js_idx"])
         nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
         num_set = set(int(n) for n in nums_arr if 0 <= int(n) <= 99)
 
+        today_ts = int(row["timestamp"] * 1000)
+
         x_base1 = dow_idx / 6.0
         x_base2 = dd / 31.0
+
         for num in range(100):
+            # Leak-free recency stats for this (date, num)
+            ts_list = hit_dates[num]
+            last_age_days = None
+            count_window = 0
+
+            if ts_list:
+                for ts in reversed(ts_list):
+                    if ts >= today_ts:
+                        continue  # skip same-day/future hits
+                    age_days = (today_ts - ts) / day_ms
+                    if last_age_days is None:
+                        last_age_days = age_days
+                    if age_days <= recency_window_days:
+                        count_window += 1
+                    else:
+                        break
+
+            if last_age_days is None:
+                recency_raw = 0.0
+                days_norm = 1.0  # "very far in the past / never"
+            else:
+                recency_raw = math.exp(-gamma * last_age_days) if gamma > 0 else 0.0
+                days_norm = min(last_age_days, max_days_norm) / max_days_norm
+
+            freq_recent = count_window / recency_window_days
+
             x3 = num / 99.0
-            y = 1 if num in num_set else 0
-            xs.append([x_base1, x_base2, x3])
-            ys.append(y)
+            x = [
+                x_base1,
+                x_base2,
+                x3,
+                recency_raw,
+                freq_recent,
+                days_norm,
+            ]
+            y_val = 1 if num in num_set else 0
+            xs.append(x)
+            ys.append(y_val)
 
     if not xs:
         return None, None
+
     X = np.array(xs, dtype=np.float32)
     y = np.array(ys, dtype=np.int32)
     return X, y
 
 
-def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 0.8):
+def ens_train_catboost(
+    df: pd.DataFrame,
+    lottery_key: str,
+    train_ratio: float = 0.8,
+    recency_half_life: float = 30.0,
+    recency_window_days: float = 90.0,
+):
+    """
+    Train CatBoost on per-(date, num) dataset, with:
+    - leak-free recency features
+    - class weighting for hits
+    """
     from sklearn.metrics import accuracy_score, roc_auc_score
 
-    X, y = ens_build_dataset(df, lottery_key)
+    X, y = ens_build_dataset(
+        df,
+        lottery_key,
+        recency_half_life=recency_half_life,
+        recency_window_days=recency_window_days,
+    )
     if X is None:
         raise ValueError("No samples built for ensemble model.")
 
@@ -433,10 +527,11 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
     X_val = X[n_train:]
     y_val = y[n_train:]
 
-    # Compute class weight for positive class (any hit for that number)
-    pos_frac = float(y_train.mean()) if len(y_train) > 0 else 0.0
-    if pos_frac > 0 and pos_frac < 1:
-        scale_pos_weight = (1.0 - pos_frac) / pos_frac
+    # Class weighting to favour hits (positive class)
+    pos_count = int(y_train.sum())
+    neg_count = int(len(y_train) - pos_count)
+    if pos_count > 0 and neg_count > 0:
+        scale_pos_weight = float(neg_count) / float(pos_count)
     else:
         scale_pos_weight = 1.0
 
@@ -470,7 +565,7 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
         "n_val": int(n - n_train),
         "val_accuracy": val_acc,
         "val_auc": val_auc,
-        "pos_frac_train": pos_frac,
+        "pos_frac_train": float(pos_count) / float(len(y_train)) if len(y_train) > 0 else float("nan"),
         "scale_pos_weight": scale_pos_weight,
     }
     return model, metrics
@@ -478,20 +573,10 @@ def ens_train_catboost(df: pd.DataFrame, lottery_key: str, train_ratio: float = 
 
 def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: bool):
     """
-    Build weekly/monthly probability profiles for numbers 0–99 using ONLY the rows in df
-    (which should already be truncated to history < prediction date when called).
+    Weekly / monthly probability profiles.
+    recency_mode=True -> exponential decay by age; False -> uniform.
     """
-    if df.empty:
-        weekly_profile = np.zeros((100, 7), dtype=float)
-        monthly_profile = np.zeros((100, 32), dtype=float)
-        return {
-            "weekly_profile": weekly_profile,
-            "monthly_profile": monthly_profile,
-            "max_weekly": 0.0,
-            "max_monthly": 0.0,
-        }
-
-    now_ts = int(df["timestamp"].max() * 1000)
+    now_ts = int(datetime.utcnow().timestamp() * 1000)
     day_ms = 24 * 60 * 60 * 1000
     lam = 0.02
 
@@ -519,8 +604,11 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
             continue
 
         ts = int(row["timestamp"] * 1000)
-        age_days = max(0.0, (now_ts - ts) / day_ms)
-        w = float(np.exp(-lam * age_days)) if recency_mode else 1.0
+        if recency_mode:
+            age_days = max(0.0, (now_ts - ts) / day_ms)
+            w = float(np.exp(-lam * age_days))
+        else:
+            w = 1.0
 
         tot_dow[dow_index] += w
         tot_dom[dd] += w
@@ -564,28 +652,6 @@ def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: 
     }
 
 
-def ens_build_hit_dates(df: pd.DataFrame, lottery_key: str):
-    """
-    Build per-number hit date timestamps (ms) from df (which should be truncated to history < prediction date).
-    """
-    hit_dates = [[] for _ in range(100)]
-    if df.empty:
-        return hit_dates
-
-    df_sorted = df.sort_values("date")
-    for _, row in df_sorted.iterrows():
-        ts = int(row["timestamp"] * 1000)
-        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
-        for raw in nums_arr:
-            try:
-                num = int(raw)
-            except ValueError:
-                continue
-            if 0 <= num <= 99:
-                hit_dates[num].append(ts)
-    return hit_dates
-
-
 def ens_score_numbers_for_date(
     model,
     df: pd.DataFrame,
@@ -593,9 +659,28 @@ def ens_score_numbers_for_date(
     prob_mode: str,
     prob_weight_coeff: float,
     prediction_date: date,
+    recency_half_life: float = 30.0,
+    recency_window_days: float = 90.0,
+    recency_alpha: float = 0.7,
 ):
+    """
+    Score 0–99 for a given prediction date using:
+    - CatBoost ensemble (ML)
+    - Weekly / Monthly / Recency probability profiles (leak-free)
+    """
     if df.empty:
         raise ValueError("No data loaded.")
+
+    # Probability profiles (weekly/monthly) use *history* df, already trimmed by caller.
+    use_recency_profiles = prob_mode in ("weekly", "monthly", "both")
+    profiles = ens_build_number_profiles(df, lottery_key, recency_mode=use_recency_profiles)
+    weekly_profile = profiles["weekly_profile"]
+    monthly_profile = profiles["monthly_profile"]
+    max_weekly = profiles["max_weekly"]
+    max_monthly = profiles["max_monthly"]
+
+    # Recency hit dates (for 'recent' mode) computed from history df only
+    hit_dates = ens_build_hit_dates(df, lottery_key)
 
     # ML scores for this date
     dt = datetime(prediction_date.year, prediction_date.month, prediction_date.day)
@@ -607,87 +692,117 @@ def ens_score_numbers_for_date(
     feats = []
     for num in range(100):
         x3 = num / 99.0
-        feats.append([x1, x2, x3])
+        # Recency features (same formulation as training, but strictly using history df)
+        day_ms = 24 * 60 * 60 * 1000
+        today_ts = int(dt.timestamp() * 1000)
+        if recency_half_life > 0:
+            gamma = math.log(2.0) / float(recency_half_life)
+        else:
+            gamma = 0.0
+        max_days_norm = max(recency_window_days * 2.0, 365.0)
+
+        ts_list = hit_dates[num]
+        last_age_days = None
+        count_window = 0
+        if ts_list:
+            for ts in reversed(ts_list):
+                if ts >= today_ts:
+                    continue
+                age_days = (today_ts - ts) / day_ms
+                if last_age_days is None:
+                    last_age_days = age_days
+                if age_days <= recency_window_days:
+                    count_window += 1
+                else:
+                    break
+
+        if last_age_days is None:
+            recency_raw = 0.0
+            days_norm = 1.0
+        else:
+            recency_raw = math.exp(-gamma * last_age_days) if gamma > 0 else 0.0
+            days_norm = min(last_age_days, max_days_norm) / max_days_norm
+
+        freq_recent = count_window / recency_window_days
+
+        feats.append([x1, x2, x3, recency_raw, freq_recent, days_norm])
+
     X_pred = np.array(feats, dtype=np.float32)
     ml_probs = model.predict_proba(X_pred)[:, 1]
 
-    # Build probability profiles using ONLY history before this prediction date
-    df_hist = df[df["date"] < dt].copy()
-    if df_hist.empty:
-        # No history: fall back to pure ML
-        scored = []
+    # For recency-weighted mode, we now build a sharper recency profile:
+    # - exponential half-life
+    # - per-date max-normalisation
+    # - alpha/beta weighting between "last hit" and "short-window frequency".
+    if prob_mode == "recent":
+        day_ms = 24 * 60 * 60 * 1000
+        today_ts = int(dt.timestamp() * 1000)
+        if recency_half_life > 0:
+            gamma = math.log(2.0) / float(recency_half_life)
+        else:
+            gamma = 0.0
+
+        rec_raw_all = np.zeros(100, dtype=float)
+        freq_all = np.zeros(100, dtype=float)
+
         for num in range(100):
-            ml_score = float(ml_probs[num])
-            scored.append(
-                {
-                    "number": num,
-                    "ml_score": ml_score,
-                    "prob_score": 0.0,
-                    "final_score": ml_score,
-                }
-            )
-        return sorted(scored, key=lambda r: r["final_score"], reverse=True)
+            ts_list = hit_dates[num]
+            last_age_days = None
+            count_window = 0
+            if ts_list:
+                for ts in reversed(ts_list):
+                    if ts >= today_ts:
+                        continue
+                    age_days = (today_ts - ts) / day_ms
+                    if last_age_days is None:
+                        last_age_days = age_days
+                    if age_days <= recency_window_days:
+                        count_window += 1
+                    else:
+                        break
 
-    use_recency_profiles = (prob_mode == "recent")
-    profiles = ens_build_number_profiles(df_hist, lottery_key, recency_mode=use_recency_profiles)
-    weekly_profile = profiles["weekly_profile"]
-    monthly_profile = profiles["monthly_profile"]
-    max_weekly = profiles["max_weekly"]
-    max_monthly = profiles["max_monthly"]
+            if last_age_days is not None and gamma > 0:
+                rec_raw_all[num] = math.exp(-gamma * last_age_days)
+            else:
+                rec_raw_all[num] = 0.0
 
-    # Recency hit dates (for 'recent' mode)
-    hit_dates = ens_build_hit_dates(df_hist, lottery_key)
+            freq_all[num] = count_window / recency_window_days
 
-    day_ms = 24 * 60 * 60 * 1000
-    today_ts = int(dt.timestamp() * 1000)
-    window_days = 90.0
+        max_rec = float(rec_raw_all.max()) if rec_raw_all.size > 0 else 0.0
+        max_freq = float(freq_all.max()) if freq_all.size > 0 else 0.0
 
     scored = []
     for num in range(100):
         ml_score = float(ml_probs[num])
 
-        w_week = 0.0
-        w_month = 0.0
-        norm_week = 0.0
-        norm_month = 0.0
-
-        if max_weekly > 0.0:
-            w_week = weekly_profile[num, dow_index]
-            norm_week = w_week / max_weekly
-        if max_monthly > 0.0 and 1 <= dd <= 31:
-            w_month = monthly_profile[num, dd]
-            norm_month = w_month / max_monthly
-
+        w_num = 0.0
         if prob_mode == "weekly":
-            w_num = norm_week
+            if max_weekly > 0.0:
+                w_week = weekly_profile[num, dow_index]
+                w_num = w_week / max_weekly
         elif prob_mode == "monthly":
-            w_num = norm_month
+            if max_monthly > 0.0 and 1 <= dd <= 31:
+                w_month = monthly_profile[num, dd]
+                w_num = w_month / max_monthly
         elif prob_mode == "both":
             vals = []
-            if norm_week > 0:
-                vals.append(norm_week)
-            if norm_month > 0:
-                vals.append(norm_month)
+            if max_weekly > 0.0:
+                vals.append(weekly_profile[num, dow_index] / max_weekly)
+            if max_monthly > 0.0 and 1 <= dd <= 31:
+                vals.append(monthly_profile[num, dd] / max_monthly)
             w_num = sum(vals) / len(vals) if vals else 0.0
         elif prob_mode == "recent":
-            hits = hit_dates[num]
-            rec_score = 0.0
-            if hits:
-                last_ts = hits[-1]
-                if last_ts <= today_ts:
-                    rec_days = (today_ts - last_ts) / day_ms
-                    rec_score = 1.0 / (1.0 + rec_days)
-
-            count = 0
-            for ts in reversed(hits):
-                age_days = (today_ts - ts) / day_ms
-                if age_days < 0:
-                    continue
-                if age_days > window_days:
-                    break
-                count += 1
-            freq3 = count / window_days
-            w_num = rec_score + freq3
+            # Normalised recency + short-window frequency
+            if max_rec > 0.0:
+                r_norm = rec_raw_all[num] / max_rec
+            else:
+                r_norm = 0.0
+            if max_freq > 0.0:
+                f_norm = freq_all[num] / max_freq
+            else:
+                f_norm = 0.0
+            beta = 1.0 - recency_alpha
+            w_num = recency_alpha * r_norm + beta * f_norm
         else:
             w_num = 0.0
 
@@ -709,448 +824,6 @@ def ens_score_numbers_for_date(
     return scored_sorted
 
 
-# -------------------- Band-first strategy helpers -------------------- #
-
-def build_band_definitions(custom_set: set):
-    """
-    Build 10 fixed decile bands (0–9, 10–19, ..., 90–99) plus one optional
-    custom band containing the user's custom_set (if not empty).
-    """
-    bands = []
-    for b in range(10):
-        lo = b * 10
-        hi = lo + 9
-        bands.append(
-            {
-                "id": b,
-                "name": f"{lo:02d}-{hi:02d}",
-                "numbers": set(range(lo, hi + 1)),
-            }
-        )
-    custom_band_id = None
-    if custom_set:
-        custom_band_id = len(bands)
-        bands.append(
-            {
-                "id": custom_band_id,
-                "name": "Custom",
-                "numbers": set(custom_set),
-            }
-        )
-    return bands, custom_band_id
-
-
-def build_band_dataset(df: pd.DataFrame, lottery_key: str, bands, lambda_rec: float = 0.03):
-    """
-    Build a chronological, leak-free dataset at (date, band) level.
-
-    Features for a given date use only history from *earlier* dates.
-    Label = 1 if that band has any hit on that date, else 0.
-    """
-    df_sorted = df.sort_values("date").reset_index(drop=True)
-    band_hit_dates = {b["id"]: [] for b in bands}  # history per band
-
-    X_rows = []
-    y_rows = []
-    meta = []
-
-    for _, row in df_sorted.iterrows():
-        dt = row["date"]
-        d = dt.date()
-        nums_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
-        actual_set = set()
-        for x in nums_arr:
-            try:
-                v = int(x)
-            except Exception:
-                continue
-            if 0 <= v <= 99:
-                actual_set.add(v)
-
-        # build features using *previous* history
-        for b in bands:
-            bid = b["id"]
-            hits = band_hit_dates[bid]
-
-            if hits:
-                days_since_last = (d - hits[-1]).days
-            else:
-                days_since_last = 9999
-
-            h7 = 0
-            h30 = 0
-            h90 = 0
-            rec_score = 0.0
-            for hd in hits:
-                age = (d - hd).days
-                if age <= 7:
-                    h7 += 1
-                if age <= 30:
-                    h30 += 1
-                if age <= 90:
-                    h90 += 1
-                if age >= 0:
-                    rec_score += float(np.exp(-lambda_rec * age))
-
-            x = {
-                "dow_js_idx": (dt.weekday() + 1) % 7,
-                "dom": dt.day,
-                "month": dt.month,
-                "year": dt.year,
-                "band_id": bid,
-                "days_since_last_hit": days_since_last,
-                "hits_last_7": h7,
-                "hits_last_30": h30,
-                "hits_last_90": h90,
-                "band_recency_score": rec_score,
-            }
-            X_rows.append(x)
-
-            y = 1 if (actual_set & b["numbers"]) else 0
-            y_rows.append(y)
-            meta.append({"date": d, "band_id": bid})
-
-        # update histories AFTER computing features
-        if actual_set:
-            for b in bands:
-                bid = b["id"]
-                if actual_set & b["numbers"]:
-                    band_hit_dates[bid].append(d)
-
-    X = pd.DataFrame(X_rows)
-    y = np.array(y_rows, dtype=np.int32)
-    return X, y, meta
-
-
-def train_band_catboost(X_band: pd.DataFrame, y_band: np.ndarray, train_ratio: float = 0.8):
-    """
-    Train a CatBoost model on band-level dataset with class weighting to handle imbalance.
-    """
-    from sklearn.metrics import accuracy_score, roc_auc_score
-
-    if X_band.empty or len(y_band) == 0:
-        raise ValueError("Empty band dataset.")
-
-    # Chronological split: dataset is already in chronological order by construction
-    n = len(X_band)
-    n_train = max(1, int(n * train_ratio))
-    if n_train >= n:
-        n_train = n - 1
-    X_train = X_band.iloc[:n_train]
-    y_train = y_band[:n_train]
-    X_val = X_band.iloc[n_train:]
-    y_val = y_band[n_train:]
-
-    pos_frac = float(y_train.mean()) if len(y_train) > 0 else 0.0
-    if pos_frac > 0 and pos_frac < 1:
-        scale_pos_weight = (1.0 - pos_frac) / pos_frac
-    else:
-        scale_pos_weight = 1.0
-
-    model = CatBoostClassifier(
-        depth=5,
-        learning_rate=0.08,
-        iterations=400,
-        loss_function="Logloss",
-        eval_metric="AUC",
-        random_seed=42,
-        verbose=False,
-        scale_pos_weight=scale_pos_weight,
-    )
-    model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
-
-    if len(X_val) > 0:
-        proba_val = model.predict_proba(X_val)[:, 1]
-        preds_val = (proba_val >= 0.5).astype(int)
-        val_acc = float(accuracy_score(y_val, preds_val))
-        try:
-            val_auc = float(roc_auc_score(y_val, proba_val))
-        except ValueError:
-            val_auc = float("nan")
-    else:
-        val_acc = float("nan")
-        val_auc = float("nan")
-
-    metrics = {
-        "samples": int(n),
-        "n_train": int(n_train),
-        "n_val": int(n - n_train),
-        "val_accuracy": val_acc,
-        "val_auc": val_auc,
-        "pos_frac_train": pos_frac,
-        "scale_pos_weight": scale_pos_weight,
-    }
-    return model, metrics
-
-
-def score_bands_for_date_from_dataset(band_model, X_band: pd.DataFrame, band_meta, bands, target_date: date):
-    """
-    Use the pre-built band dataset to score all bands for a given date
-    (must be within the historical range).
-    """
-    if X_band is None or len(X_band) == 0:
-        raise ValueError("Band dataset not built.")
-
-    # Collect row indices for this date
-    rows_idx = [i for i, m in enumerate(band_meta) if m["date"] == target_date]
-    if not rows_idx:
-        raise ValueError("No band features available for this date in the dataset.")
-
-    X_sub = X_band.iloc[rows_idx]
-    proba = band_model.predict_proba(X_sub)[:, 1]
-
-    band_dict = {b["id"]: b for b in bands}
-    out = []
-    for j, idx_row in enumerate(rows_idx):
-        meta_row = band_meta[idx_row]
-        bid = meta_row["band_id"]
-        band_info = band_dict.get(bid, None)
-        if band_info is None:
-            continue
-        out.append(
-            {
-                "band_id": bid,
-                "band_name": band_info["name"],
-                "prob": float(proba[j]),
-            }
-        )
-
-    out_sorted = sorted(out, key=lambda r: r["prob"], reverse=True)
-    return out_sorted
-
-
-def make_number_to_band_map(bands):
-    """
-    Map each number 0–99 to a band_id.
-    Custom band (if present) overrides decile band membership.
-    """
-    num_to_band = {}
-    # First assign decile bands
-    for b in bands:
-        if b["name"] == "Custom":
-            continue
-        bid = b["id"]
-        for n in b["numbers"]:
-            if 0 <= n <= 99 and n not in num_to_band:
-                num_to_band[n] = bid
-    # Then override with custom band if present
-    for b in bands:
-        if b["name"] != "Custom":
-            continue
-        bid = b["id"]
-        for n in b["numbers"]:
-            if 0 <= n <= 99:
-                num_to_band[n] = bid
-    return num_to_band
-
-
-def compute_band_quotas(band_scores, bands, top_n: int, top_band_count: int):
-    """
-    Given band_scores (sorted list of {band_id, prob}), bands definitions,
-    and desired Top N + Top bands to use, compute how many slots to give each band.
-    """
-    if top_n <= 0:
-        return {}
-
-    # restrict to top_band_count bands
-    active = band_scores[: max(1, min(top_band_count, len(band_scores)))]
-    if not active:
-        return {}
-
-    band_caps = {}
-    prob_list = []
-    band_ids = []
-    band_dict = {b["id"]: b for b in bands}
-
-    for rec in active:
-        bid = rec["band_id"]
-        band_ids.append(bid)
-        prob_list.append(max(0.0, rec["prob"]))
-        band_caps[bid] = len(band_dict[bid]["numbers"])
-
-    total_prob = sum(prob_list)
-    if total_prob <= 0:
-        weights = [1.0 / len(band_ids)] * len(band_ids)
-    else:
-        weights = [p / total_prob for p in prob_list]
-
-    # initial quotas (rounded)
-    quotas = {}
-    for bid, w in zip(band_ids, weights):
-        raw = w * top_n
-        q = int(round(raw))
-        cap = band_caps[bid]
-        if cap > 0:
-            quotas[bid] = min(max(q, 0), cap)
-        else:
-            quotas[bid] = 0
-
-    # adjust to match top_n as closely as possible
-    total_alloc = sum(quotas.values())
-
-    # If everything is zero, try to give at least 1 to bands while possible
-    if total_alloc == 0:
-        remaining = top_n
-        for bid in band_ids:
-            if remaining <= 0:
-                break
-            if band_caps[bid] > 0:
-                quotas[bid] = 1
-                remaining -= 1
-        return quotas
-
-    def try_fill(quotas, direction):
-        # direction: +1 to add, -1 to remove
-        nonlocal total_alloc
-        diff = top_n - total_alloc
-        if diff == 0:
-            return
-        if direction > 0 and diff <= 0:
-            return
-        if direction < 0 and diff >= 0:
-            return
-
-        if direction > 0:
-            # add to highest-prob bands
-            while diff > 0:
-                changed = False
-                for idx in np.argsort([-p for p in prob_list]):  # descending prob
-                    bid = band_ids[idx]
-                    if quotas[bid] < band_caps[bid]:
-                        quotas[bid] += 1
-                        diff -= 1
-                        total_alloc += 1
-                        changed = True
-                        if diff == 0:
-                            break
-                if not changed:
-                    break
-        else:
-            # remove from lowest-prob bands
-            diff = -diff
-            while diff > 0:
-                changed = False
-                for idx in np.argsort(prob_list):  # ascending prob
-                    bid = band_ids[idx]
-                    if quotas[bid] > 0:
-                        quotas[bid] -= 1
-                        diff -= 1
-                        total_alloc -= 1
-                        changed = True
-                        if diff == 0:
-                            break
-                if not changed:
-                    break
-
-    # if we allocated too many or too few, adjust
-    if total_alloc > top_n:
-        try_fill(quotas, direction=-1)
-    elif total_alloc < top_n:
-        try_fill(quotas, direction=+1)
-
-    return quotas
-
-
-def band_first_select_numbers(scored_sorted, bands, band_scores, top_n: int, top_band_count: int):
-    """
-    Combine band-level probabilities with per-number scores to choose Top N numbers.
-
-    - First pick top_band_count bands by band probability.
-    - Allocate an approximate quota of slots per band proportional to its probability.
-    - Then walk global per-number ranking, filling bands up to their quotas.
-    """
-    if top_n <= 0:
-        return []
-
-    if not band_scores:
-        # no band info: fall back to pure per-number ranking
-        selected = []
-        for idx, item in enumerate(scored_sorted[:top_n]):
-            selected.append(
-                {
-                    "Rank": idx + 1,
-                    "Number": item["number"],
-                    "Band": None,
-                    "BandProb": None,
-                    "Final Score": item["final_score"],
-                    "ML Score": item["ml_score"],
-                    "Prob Score": item["prob_score"],
-                }
-            )
-        return selected
-
-    # Compute per-band quotas
-    quotas = compute_band_quotas(band_scores, bands, top_n, top_band_count)
-    if not quotas:
-        # fallback to pure ranking if quotas empty
-        selected = []
-        for idx, item in enumerate(scored_sorted[:top_n]):
-            selected.append(
-                {
-                    "Rank": idx + 1,
-                    "Number": item["number"],
-                    "Band": None,
-                    "BandProb": None,
-                    "Final Score": item["final_score"],
-                    "ML Score": item["ml_score"],
-                    "Prob Score": item["prob_score"],
-                }
-            )
-        return selected
-
-    num_to_band = make_number_to_band_map(bands)
-    band_prob_map = {rec["band_id"]: rec["prob"] for rec in band_scores}
-    band_name_map = {b["id"]: b["name"] for b in bands}
-
-    band_selected = {bid: 0 for bid in quotas.keys()}
-    selected_rows = []
-
-    for item in scored_sorted:
-        num = item["number"]
-        bid = num_to_band.get(num, None)
-        if bid is None:
-            continue
-        if bid not in quotas or quotas[bid] <= 0:
-            continue
-        if band_selected[bid] >= quotas[bid]:
-            continue
-
-        row = {
-            "Number": num,
-            "Band": band_name_map.get(bid, None),
-            "BandProb": band_prob_map.get(bid, None),
-            "Final Score": item["final_score"],
-            "ML Score": item["ml_score"],
-            "Prob Score": item["prob_score"],
-        }
-        selected_rows.append(row)
-        band_selected[bid] += 1
-
-        if len(selected_rows) >= top_n:
-            break
-
-    # If we selected nothing for some reason, fall back
-    if not selected_rows:
-        for idx, item in enumerate(scored_sorted[:top_n]):
-            selected_rows.append(
-                {
-                    "Number": item["number"],
-                    "Band": None,
-                    "BandProb": None,
-                    "Final Score": item["final_score"],
-                    "ML Score": item["ml_score"],
-                    "Prob Score": item["prob_score"],
-                }
-            )
-
-    # Add Rank
-    selected_rows_sorted = sorted(selected_rows, key=lambda r: r["Final Score"], reverse=True)
-    for idx, row in enumerate(selected_rows_sorted):
-        row["Rank"] = idx + 1
-
-    return selected_rows_sorted
-
-
 # -------------------- Streamlit UI -------------------- #
 
 st.set_page_config(
@@ -1170,8 +843,6 @@ st.markdown(
        - **Probability Weight Strategy** (Weekly / Monthly / Both / Recency-weighted 3-month focus)
        - **ML / Probability blending** slider
        - **Core / Mid / Edge** tier sizing within Top N.
-    3. **Band-First Strategy** — predict which bands (0–9, 10–19, ..., 90–99, and optional **Custom band**)
-       are hot for a date, then rank numbers *inside* those bands.
     """
 )
 
@@ -1193,7 +864,6 @@ if rmin > rmax:
 
 custom_set = parse_custom_nums(custom_text)
 
-# Session state init
 if "built_df" not in st.session_state:
     st.session_state["built_df"] = None
     st.session_state["has_gz"] = True
@@ -1204,14 +874,6 @@ if "built_df" not in st.session_state:
     st.session_state["cb_range_metrics"] = None
     st.session_state["ens_model"] = None
     st.session_state["ens_metrics"] = None
-    # band-first
-    st.session_state["band_X"] = None
-    st.session_state["band_y"] = None
-    st.session_state["band_meta"] = None
-    st.session_state["band_defs"] = None
-    st.session_state["band_model"] = None
-    st.session_state["band_metrics"] = None
-    st.session_state["band_lottery_key"] = None
 
 analyze_clicked = st.button("Analyze & Prepare Data")
 
@@ -1231,14 +893,6 @@ if uploaded and analyze_clicked:
         st.session_state["cb_range_metrics"] = None
         st.session_state["ens_model"] = None
         st.session_state["ens_metrics"] = None
-        # reset band-first
-        st.session_state["band_X"] = None
-        st.session_state["band_y"] = None
-        st.session_state["band_meta"] = None
-        st.session_state["band_defs"] = None
-        st.session_state["band_model"] = None
-        st.session_state["band_metrics"] = None
-        st.session_state["band_lottery_key"] = None
         print(f"Parsed {count_dates} unique dates from CSV.")
     except Exception as e:
         print(f"Error parsing CSV: {e}")
@@ -1246,11 +900,7 @@ if uploaded and analyze_clicked:
 built_df = st.session_state.get("built_df", None)
 
 # -------------------- Tabs -------------------- #
-tab1, tab2, tab3 = st.tabs([
-    "Range Wins + CatBoost (Any WIN)",
-    "ML — Ensemble Number Prediction (0–99)",
-    "Band-First Strategy (Bands + Numbers)",
-])
+tab1, tab2 = st.tabs(["Range Wins + CatBoost (Any WIN)", "ML — Ensemble Number Prediction (0–99)"])
 
 # ==================== TAB 1: Range Wins ==================== #
 with tab1:
@@ -1374,7 +1024,6 @@ with tab1:
             else:
                 st.info("Train the range-level CatBoost model to enable date-wise predictions.")
 
-
 # ==================== TAB 2: ML Ensemble 0–99 ==================== #
 with tab2:
     if built_df is None or built_df.empty:
@@ -1413,8 +1062,47 @@ with tab2:
         lottery_key = lot_key_map[lottery_choice]
 
         st.markdown(
-            "*Default 0.4 = 60% ML + 40% probability, matching your browser slider semantics.*"
+            "*Default 0.4 = 60% ML + 40% probability, exactly matching your browser slider semantics.*"
         )
+
+        # Recency-specific advanced settings
+        recency_half_life = 30.0
+        recency_window_days = 90.0
+        recency_alpha = 0.7
+        if prob_mode_label == "Recency-weighted (3-month focus)":
+            with st.expander("Recency settings (advanced)", expanded=False):
+                recency_half_life = st.number_input(
+                    "Recency half-life (days)",
+                    min_value=1.0,
+                    max_value=365.0,
+                    value=30.0,
+                    step=1.0,
+                    key="rec_half_life",
+                )
+                recency_window_days = st.number_input(
+                    "Recency window (days)",
+                    min_value=7.0,
+                    max_value=365.0,
+                    value=90.0,
+                    step=1.0,
+                    key="rec_window_days",
+                )
+                recency_alpha = st.slider(
+                    "Recency weight α (recency vs frequency)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.7,
+                    step=0.05,
+                    key="rec_alpha",
+                )
+
+        prob_mode_map = {
+            "Weekly only": "weekly",
+            "Monthly only": "monthly",
+            "Weekly + Monthly (avg)": "both",
+            "Recency-weighted (3-month focus)": "recent",
+        }
+        prob_mode = prob_mode_map[prob_mode_label]
 
         st.markdown("---")
         st.markdown("**Core / Mid / Edge sizing** — `Core + Mid ≤ Top N` (Edge = remaining).")
@@ -1448,11 +1136,15 @@ with tab2:
 
         if st.button("Train Ensemble Model (CatBoost)", key="ens_train_btn"):
             with st.spinner("Training CatBoost ensemble model (0–99)..."):
-                model, metrics = ens_train_catboost(built_df, lottery_key, train_ratio=ens_train_ratio)
+                model, metrics = ens_train_catboost(
+                    built_df,
+                    lottery_key,
+                    train_ratio=ens_train_ratio,
+                    recency_half_life=recency_half_life,
+                    recency_window_days=recency_window_days,
+                )
                 st.session_state["ens_model"] = model
                 st.session_state["ens_metrics"] = metrics
-                st.session_state["ens_lottery_choice"] = lottery_choice
-                st.session_state["ens_lottery_key"] = lottery_key
 
             m = metrics
             mcols = st.columns(4)
@@ -1464,15 +1156,12 @@ with tab2:
                 f"{m['val_accuracy']*100:.2f}%" if not np.isnan(m["val_accuracy"]) else "NA",
             )
             st.caption(
-                f"AUC: {m['val_auc']:.4f} • Pos frac (train): {m['pos_frac_train']:.4f} • "
+                f"AUC: {m['val_auc']:.4f}  •  "
+                f"Pos frac (train): {m['pos_frac_train']:.4f}  •  "
                 f"scale_pos_weight: {m['scale_pos_weight']:.2f}"
-                if not np.isnan(m["val_auc"])
-                else f"AUC: NA • Pos frac (train): {m['pos_frac_train']:.4f} • "
-                     f"scale_pos_weight: {m['scale_pos_weight']:.2f}"
             )
 
         ens_model = st.session_state.get("ens_model")
-        ens_lottery_key = st.session_state.get("ens_lottery_key", lottery_key)
 
         st.markdown("---")
         st.subheader("2) Score numbers 0–99 for a prediction date")
@@ -1489,69 +1178,71 @@ with tab2:
                 key="ens_pred_date",
             )
 
-            prob_mode_map = {
-                "Weekly only": "weekly",
-                "Monthly only": "monthly",
-                "Weekly + Monthly (avg)": "both",
-                "Recency-weighted (3-month focus)": "recent",
-            }
-            prob_mode = prob_mode_map[prob_mode_label]
-
             if st.button("Score numbers (Core / Mid / Edge)", key="ens_score_btn"):
-                with st.spinner("Scoring numbers 0–99 with ML + probability fusion..."):
-                    scored_sorted = ens_score_numbers_for_date(
-                        ens_model,
-                        built_df,
-                        lottery_key=ens_lottery_key,
-                        prob_mode=prob_mode,
-                        prob_weight_coeff=float(prob_weight),
-                        prediction_date=pred_date,
+                # Use only history up to the day *before* prediction_date (leak-free)
+                history_mask = built_df["date"].dt.date < pred_date
+                history_df = built_df.loc[history_mask].copy()
+
+                if history_df.empty:
+                    st.warning("No historical data before this prediction date.")
+                else:
+                    with st.spinner("Scoring numbers 0–99 with ML + probability fusion..."):
+                        scored_sorted = ens_score_numbers_for_date(
+                            ens_model,
+                            history_df,
+                            lottery_key=lottery_key,
+                            prob_mode=prob_mode,
+                            prob_weight_coeff=float(prob_weight),
+                            prediction_date=pred_date,
+                            recency_half_life=recency_half_life,
+                            recency_window_days=recency_window_days,
+                            recency_alpha=recency_alpha,
+                        )
+
+                    top_list = scored_sorted[: int(top_n)]
+                    rows = []
+                    for idx, item in enumerate(top_list):
+                        num = item["number"]
+                        ml_score = item["ml_score"]
+                        prob_score = item["prob_score"]
+                        final_score = item["final_score"]
+
+                        if idx < core_count:
+                            tier = "Core"
+                        elif idx < core_count + mid_count:
+                            tier = "Mid"
+                        else:
+                            tier = "Edge"
+
+                        rows.append(
+                            {
+                                "Rank": idx + 1,
+                                "Number": num,
+                                "Tier": tier,
+                                "Final Score": round(final_score, 6),
+                                "ML Score": round(ml_score, 6),
+                                "Prob Score": round(prob_score, 6),
+                            }
+                        )
+
+                    result_df = pd.DataFrame(rows)
+                    st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+                    csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download Top-N (Core/Mid/Edge) as CSV",
+                        data=csv_bytes,
+                        file_name="ml_ensemble_top_numbers.csv",
+                        mime="text/csv",
                     )
 
-                top_list = scored_sorted[: int(top_n)]
-                rows = []
-                for idx, item in enumerate(top_list):
-                    num = item["number"]
-                    ml_score = item["ml_score"]
-                    prob_score = item["prob_score"]
-                    final_score = item["final_score"]
-
-                    if idx < core_count:
-                        tier = "Core"
-                    elif idx < core_count + mid_count:
-                        tier = "Mid"
-                    else:
-                        tier = "Edge"
-
-                    rows.append(
-                        {
-                            "Rank": idx + 1,
-                            "Number": num,
-                            "Tier": tier,
-                            "Final Score": round(final_score, 6),
-                            "ML Score": round(ml_score, 6),
-                            "Prob Score": round(prob_score, 6),
-                        }
+                    st.success(
+                        f"Scored numbers 0–99 for {pred_date.isoformat()} "
+                        f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
+                        f"blend={prob_weight:.2f}."
                     )
 
-                result_df = pd.DataFrame(rows)
-                st.dataframe(result_df, use_container_width=True, hide_index=True)
-
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download Top-N (Core/Mid/Edge) as CSV",
-                    data=csv_bytes,
-                    file_name="ml_ensemble_top_numbers.csv",
-                    mime="text/csv",
-                )
-
-                st.success(
-                    f"Scored numbers 0–99 for {pred_date.isoformat()} "
-                    f"using **{lottery_choice}**, prob mode **{prob_mode_label}**, "
-                    f"blend={prob_weight:.2f}."
-                )
-
-        # 3) Backtest ensemble vs actual for a date range
+        # 3) Backtest ensemble vs actual for a date range (leak-free)
         if ens_model is not None:
             st.markdown("---")
             st.subheader("3) Backtest ensemble vs actual results (date range)")
@@ -1583,24 +1274,18 @@ with tab2:
                     core_hits_total = 0
                     core_mid_hits_total = 0
 
-                    prob_mode_map = {
-                        "Weekly only": "weekly",
-                        "Monthly only": "monthly",
-                        "Weekly + Monthly (avg)": "both",
-                        "Recency-weighted (3-month focus)": "recent",
-                    }
-                    prob_mode_bt = prob_mode_map[prob_mode_label]
-
                     detail_rows = []
 
                     for offset in range(total_calendar_days):
                         d = eval_start + timedelta(days=offset)
-                        mask = built_df["date"].dt.date == d
-                        if not mask.any():
+
+                        # Actual results on day d (using full df)
+                        mask_day = built_df["date"].dt.date == d
+                        if not mask_day.any():
                             continue
 
-                        row = built_df.loc[mask].iloc[0]
-                        actual_arr = row[ens_lottery_key] if isinstance(row[ens_lottery_key], list) else []
+                        row = built_df.loc[mask_day].iloc[0]
+                        actual_arr = row[lottery_key] if isinstance(row[lottery_key], list) else []
                         actual_set = set()
                         for x in actual_arr:
                             try:
@@ -1613,15 +1298,24 @@ with tab2:
                         if not actual_set:
                             continue
 
+                        # History up to the day *before* d
+                        history_mask = built_df["date"].dt.date < d
+                        history_df = built_df.loc[history_mask].copy()
+                        if history_df.empty:
+                            continue
+
                         dates_with_data += 1
 
                         scored_sorted = ens_score_numbers_for_date(
                             ens_model,
-                            built_df,
-                            lottery_key=ens_lottery_key,
-                            prob_mode=prob_mode_bt,
+                            history_df,
+                            lottery_key=lottery_key,
+                            prob_mode=prob_mode,
                             prob_weight_coeff=float(prob_weight),
                             prediction_date=d,
+                            recency_half_life=recency_half_life,
+                            recency_window_days=recency_window_days,
+                            recency_alpha=recency_alpha,
                         )
 
                         top_list = scored_sorted[: int(top_n)]
@@ -1688,413 +1382,6 @@ with tab2:
                                 file_name="ensemble_backtest_details.csv",
                                 mime="text/csv",
                             )
-
-
-# ==================== TAB 3: Band-First Strategy ==================== #
-with tab3:
-    if built_df is None or built_df.empty:
-        st.info("Upload a CSV and click **Analyze & Prepare Data** first. This populates the dataset.")
-    elif not CATBOOST_AVAILABLE:
-        st.error("CatBoost is not installed. Install it with `pip install catboost` to use the band-first model.")
-    else:
-        st.subheader("Band-First Strategy (Bands → Numbers)")
-
-        st.markdown(
-            """
-            **Idea**: first predict which bands are hot on a given date, then rank numbers *inside* those bands.
-
-            - Fixed bands: **0–9, 10–19, ..., 90–99**
-            - Optional **Custom band** = your **Custom numbers** from the header (if not empty).
-            """
-        )
-
-        col_b1, col_b2, col_b3 = st.columns(3)
-        band_lottery_choice = col_b1.selectbox(
-            "Lottery for band model",
-            ["DR", "FB", "GZ/GB", "GL"],
-            index=0,
-        )
-        lot_key_map = {
-            "DR": "DR",
-            "FB": "FB",
-            "GZ/GB": "GZGB",
-            "GL": "GL",
-        }
-        band_lottery_key = lot_key_map[band_lottery_choice]
-
-        # train/val split for band model
-        band_train_ratio = col_b2.slider(
-            "Train/Validation split (chronological) — band model",
-            min_value=0.6,
-            max_value=0.9,
-            value=0.8,
-            step=0.05,
-            key="band_train_ratio",
-        )
-
-        top_band_count = col_b3.number_input(
-            "Max bands to use (Top-K bands by probability)",
-            min_value=1,
-            max_value=11,
-            value=4,
-            step=1,
-        )
-
-        st.caption(
-            "If you have a Custom band (from the header), it is treated as a separate band named **Custom**."
-        )
-
-        # Build band definitions from current custom_set
-        bands, custom_band_id = build_band_definitions(custom_set)
-
-        st.markdown("---")
-        st.subheader("1) Train Band Model (CatBoost, band-level)")
-
-        if st.button("Train Band Model", key="band_train_btn"):
-            with st.spinner("Building band dataset and training CatBoost band model..."):
-                X_band, y_band, band_meta = build_band_dataset(built_df, band_lottery_key, bands)
-                band_model, band_metrics = train_band_catboost(X_band, y_band, train_ratio=band_train_ratio)
-
-                st.session_state["band_X"] = X_band
-                st.session_state["band_y"] = y_band
-                st.session_state["band_meta"] = band_meta
-                st.session_state["band_defs"] = bands
-                st.session_state["band_model"] = band_model
-                st.session_state["band_metrics"] = band_metrics
-                st.session_state["band_lottery_key"] = band_lottery_key
-
-            m = band_metrics
-            bm1, bm2, bm3, bm4 = st.columns(4)
-            bm1.metric("Samples", m["samples"])
-            bm2.metric("Train samples", m["n_train"])
-            bm3.metric("Val samples", m["n_val"])
-            bm4.metric(
-                "Val accuracy",
-                f"{m['val_accuracy']*100:.2f}%" if not np.isnan(m["val_accuracy"]) else "NA",
-            )
-            st.caption(
-                f"AUC: {m['val_auc']:.4f} • Pos frac (train): {m['pos_frac_train']:.4f} • "
-                f"scale_pos_weight: {m['scale_pos_weight']:.2f}"
-                if not np.isnan(m["val_auc"])
-                else f"AUC: NA • Pos frac (train): {m['pos_frac_train']:.4f} • "
-                     f"scale_pos_weight: {m['scale_pos_weight']:.2f}"
-            )
-
-        band_model = st.session_state.get("band_model")
-        band_X = st.session_state.get("band_X")
-        band_meta = st.session_state.get("band_meta")
-        band_defs = st.session_state.get("band_defs") or bands
-        band_lottery_key_state = st.session_state.get("band_lottery_key", band_lottery_key)
-
-        st.markdown("---")
-        st.subheader("2) Score numbers using Band-First strategy for a prediction date")
-
-        ens_model = st.session_state.get("ens_model")
-        ens_lottery_key_state = st.session_state.get("ens_lottery_key", band_lottery_key_state)
-
-        if band_model is None or band_X is None or band_meta is None:
-            st.info("Train the band model first (Step 1).")
-        elif ens_model is None:
-            st.info("Train the ensemble model in Tab 2 first; Band-First reuses its per-number scores.")
-        else:
-            # Scoring controls for numbers (same semantics as Tab 2)
-            col_s1, col_s2, col_s3 = st.columns(3)
-            prob_mode_label_b = col_s1.radio(
-                "Probability Weight Strategy (for numbers)",
-                ["Weekly only", "Monthly only", "Weekly + Monthly (avg)", "Recency-weighted (3-month focus)"],
-                key="band_prob_mode",
-            )
-            prob_weight_b = col_s2.number_input(
-                "ML / Probability blending (0 = pure ML, 1 = pure probability) — for numbers",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.4,
-                step=0.05,
-                key="band_prob_weight",
-            )
-            top_n_b = col_s3.number_input(
-                "Top N numbers (Band-First)",
-                min_value=1,
-                max_value=100,
-                value=20,
-                step=1,
-                key="band_top_n",
-            )
-
-            # Tier sizing
-            cbs1, cbs2, cbs3 = st.columns(3)
-            core_count_b = cbs1.number_input(
-                "Core size (Band-First)",
-                min_value=0,
-                max_value=100,
-                value=8,
-                step=1,
-                key="band_core_count",
-            )
-            mid_count_b = cbs2.number_input(
-                "Mid size (Band-First)",
-                min_value=0,
-                max_value=100,
-                value=6,
-                step=1,
-                key="band_mid_count",
-            )
-            if core_count_b + mid_count_b > top_n_b:
-                mid_count_b = max(0, top_n_b - core_count_b)
-                st.warning(f"Adjusted Mid to {mid_count_b} so Core + Mid ≤ Top N.")
-            edge_count_b = max(0, top_n_b - core_count_b - mid_count_b)
-
-            st.caption(
-                f"Core: **{core_count_b}**, Mid: **{mid_count_b}**, Edge (within Top N): **{edge_count_b}**."
-            )
-
-            # Prediction date: use *last available date* so there is full band history
-            last_date = built_df["date"].max().date()
-            pred_date_band = st.date_input(
-                "Prediction date for Band-First ranking (within historical range)",
-                value=last_date,
-                min_value=built_df["date"].min().date(),
-                max_value=last_date,
-                key="band_pred_date",
-            )
-
-            prob_mode_map_b = {
-                "Weekly only": "weekly",
-                "Monthly only": "monthly",
-                "Weekly + Monthly (avg)": "both",
-                "Recency-weighted (3-month focus)": "recent",
-            }
-            prob_mode_b = prob_mode_map_b[prob_mode_label_b]
-
-            if st.button("Score numbers with Band-First strategy", key="band_score_btn"):
-                with st.spinner("Scoring bands and numbers (Band-First)..."):
-                    # 1) Band probabilities for this date (from band dataset)
-                    band_scores = score_bands_for_date_from_dataset(
-                        band_model,
-                        band_X,
-                        band_meta,
-                        band_defs,
-                        pred_date_band,
-                    )
-
-                    # 2) Per-number scores for this date (ensemble model)
-                    scored_sorted = ens_score_numbers_for_date(
-                        ens_model,
-                        built_df,
-                        lottery_key=ens_lottery_key_state,
-                        prob_mode=prob_mode_b,
-                        prob_weight_coeff=float(prob_weight_b),
-                        prediction_date=pred_date_band,
-                    )
-
-                    # 3) Combine: Band-First selection
-                    selected_rows = band_first_select_numbers(
-                        scored_sorted,
-                        band_defs,
-                        band_scores,
-                        top_n=int(top_n_b),
-                        top_band_count=int(top_band_count),
-                    )
-
-                # Build DataFrame with tiers
-                rows_out = []
-                for idx, row in enumerate(selected_rows):
-                    if idx < core_count_b:
-                        tier = "Core"
-                    elif idx < core_count_b + mid_count_b:
-                        tier = "Mid"
-                    else:
-                        tier = "Edge"
-                    rows_out.append(
-                        {
-                            "Rank": idx + 1,
-                            "Number": row["Number"],
-                            "Tier": tier,
-                            "Band": row["Band"],
-                            "BandProb": None if row["BandProb"] is None else round(row["BandProb"], 4),
-                            "Final Score": round(row["Final Score"], 6),
-                            "ML Score": round(row["ML Score"], 6),
-                            "Prob Score": round(row["Prob Score"], 6),
-                        }
-                    )
-
-                df_band = pd.DataFrame(rows_out)
-                st.dataframe(df_band, use_container_width=True, hide_index=True)
-
-                csv_bytes = df_band.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download Band-First Top-N as CSV",
-                    data=csv_bytes,
-                    file_name="band_first_top_numbers.csv",
-                    mime="text/csv",
-                )
-
-                st.success(
-                    f"Band-First selection for {pred_date_band.isoformat()} — "
-                    f"lottery **{band_lottery_choice}**, using top **{top_band_count}** bands."
-                )
-
-        # 3) Backtest Band-First vs actual
-        if band_model is not None and band_X is not None and band_meta is not None and ens_model is not None:
-            st.markdown("---")
-            st.subheader("3) Backtest Band-First vs actual results (date range)")
-
-            eval_min_date_b = built_df["date"].min().date()
-            eval_max_date_b = built_df["date"].max().date()
-
-            eval_date_sel_b = st.date_input(
-                "Evaluation date range for Band-First backtest",
-                (eval_min_date_b, eval_max_date_b),
-                min_value=eval_min_date_b,
-                max_value=eval_max_date_b,
-                key="band_eval_range",
-            )
-
-            if isinstance(eval_date_sel_b, tuple) and len(eval_date_sel_b) == 2:
-                eval_start_b, eval_end_b = eval_date_sel_b
-            else:
-                eval_start_b = eval_end_b = eval_date_sel_b
-
-            if eval_start_b > eval_end_b:
-                st.error("Evaluation start date is after end date.")
-            else:
-                if st.button("Run Band-First backtest", key="band_backtest_btn"):
-                    total_calendar_days_b = (eval_end_b - eval_start_b).days + 1
-                    dates_with_data_b = 0
-                    total_hits_all_b = 0
-                    core_hits_total_b = 0
-                    core_mid_hits_total_b = 0
-
-                    prob_mode_label_b2 = st.session_state.get("band_prob_mode", "Monthly only")
-                    prob_weight_b2 = float(st.session_state.get("band_prob_weight", 0.4))
-                    top_n_b2 = int(st.session_state.get("band_top_n", 20))
-                    core_count_b2 = int(st.session_state.get("band_core_count", 8))
-                    mid_count_b2 = int(st.session_state.get("band_mid_count", 6))
-
-                    prob_mode_map_b2 = {
-                        "Weekly only": "weekly",
-                        "Monthly only": "monthly",
-                        "Weekly + Monthly (avg)": "both",
-                        "Recency-weighted (3-month focus)": "recent",
-                    }
-                    prob_mode_b2 = prob_mode_map_b2.get(prob_mode_label_b2, "monthly")
-
-                    detail_rows_b = []
-
-                    for offset in range(total_calendar_days_b):
-                        d = eval_start_b + timedelta(days=offset)
-                        mask = built_df["date"].dt.date == d
-                        if not mask.any():
-                            continue
-
-                        row = built_df.loc[mask].iloc[0]
-                        actual_arr = row[band_lottery_key_state] if isinstance(row[band_lottery_key_state], list) else []
-                        actual_set = set()
-                        for x in actual_arr:
-                            try:
-                                v = int(x)
-                            except Exception:
-                                continue
-                            if 0 <= v <= 99:
-                                actual_set.add(v)
-
-                        if not actual_set:
-                            continue
-
-                        # We only have band features for dates in the band dataset.
-                        try:
-                            band_scores_d = score_bands_for_date_from_dataset(
-                                band_model,
-                                band_X,
-                                band_meta,
-                                band_defs,
-                                d,
-                            )
-                        except ValueError:
-                            continue
-
-                        scored_sorted_d = ens_score_numbers_for_date(
-                            ens_model,
-                            built_df,
-                            lottery_key=band_lottery_key_state,
-                            prob_mode=prob_mode_b2,
-                            prob_weight_coeff=prob_weight_b2,
-                            prediction_date=d,
-                        )
-
-                        selected_rows_d = band_first_select_numbers(
-                            scored_sorted_d,
-                            band_defs,
-                            band_scores_d,
-                            top_n=top_n_b2,
-                            top_band_count=int(top_band_count),
-                        )
-
-                        dates_with_data_b += 1
-
-                        core_hits = 0
-                        mid_hits = 0
-                        edge_hits = 0
-
-                        for idx, row_sel in enumerate(selected_rows_d):
-                            num = row_sel["Number"]
-                            if num in actual_set:
-                                if idx < core_count_b2:
-                                    core_hits += 1
-                                elif idx < core_count_b2 + mid_count_b2:
-                                    mid_hits += 1
-                                else:
-                                    edge_hits += 1
-
-                        day_total_hits = core_hits + mid_hits + edge_hits
-                        total_hits_all_b += day_total_hits
-                        core_hits_total_b += core_hits
-                        core_mid_hits_total_b += core_hits + mid_hits
-
-                        detail_rows_b.append(
-                            {
-                                "Date": d.isoformat(),
-                                "Day": row["dow_label"],
-                                "Actual": " ".join(str(n) for n in sorted(actual_set)),
-                                "Core Hits": core_hits,
-                                "Mid Hits": mid_hits,
-                                "Edge Hits": edge_hits,
-                                "Total Hits": day_total_hits,
-                            }
-                        )
-
-                    if dates_with_data_b == 0:
-                        st.warning("No dates with actual data found in this range for Band-First backtesting.")
-                    else:
-                        avg_hits_per_date_b = total_hits_all_b / dates_with_data_b
-                        core_hit_rate_b = (core_hits_total_b / dates_with_data_b) * 100.0
-                        core_mid_hit_rate_b = (core_mid_hits_total_b / dates_with_data_b) * 100.0
-                        any_tier_hit_rate_b = (total_hits_all_b / dates_with_data_b) * 100.0
-
-                        mb1, mb2, mb3, mb4 = st.columns(4)
-                        mb1.metric("Dates in range", total_calendar_days_b)
-                        mb2.metric("Dates with actual data", dates_with_data_b)
-                        mb3.metric("Total hits (all tiers)", total_hits_all_b)
-                        mb4.metric("Avg hits / date (past only)", f"{avg_hits_per_date_b:.2f}")
-
-                        nb1, nb2, nb3, nb4 = st.columns(4)
-                        nb1.metric("Core hit rate", f"{core_hit_rate_b:.1f}%")
-                        nb2.metric("Core+Mid hit rate", f"{core_mid_hit_rate_b:.1f}%")
-                        nb3.metric("Any tier hit rate", f"{any_tier_hit_rate_b:.1f}%")
-                        nb4.metric("Lottery", band_lottery_choice)
-
-                        if detail_rows_b:
-                            detail_df_b = pd.DataFrame(detail_rows_b)
-                            st.dataframe(detail_df_b, use_container_width=True, hide_index=True)
-
-                            csv_bytes = detail_df_b.to_csv(index=False).encode("utf-8")
-                            st.download_button(
-                                "Download Band-First backtest details as CSV",
-                                data=csv_bytes,
-                                file_name="band_first_backtest_details.csv",
-                                mime="text/csv",
-                            )
-
 
 # ==================== Global Date Range Lookup ==================== #
 
