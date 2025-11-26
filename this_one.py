@@ -571,6 +571,71 @@ def ens_train_catboost(
     return model, metrics
 
 
+def ens_auto_search_best_model(
+    df: pd.DataFrame,
+    lottery_key: str,
+    candidate_train_ratios=(0.7, 0.8, 0.85),
+    candidate_half_lives=(15.0, 30.0, 60.0),
+    candidate_windows=(60.0, 90.0, 120.0),
+):
+    """
+    Run a small grid-search over (train_ratio, recency_half_life, recency_window_days)
+    and return the model/config with the best validation accuracy.
+    """
+    rows = []
+    best_model = None
+    best_metrics = None
+    best_cfg = None
+    best_val_acc = -1.0  # start very low
+
+    for tr in candidate_train_ratios:
+        for hl in candidate_half_lives:
+            for win in candidate_windows:
+                try:
+                    model, metrics = ens_train_catboost(
+                        df,
+                        lottery_key,
+                        train_ratio=tr,
+                        recency_half_life=hl,
+                        recency_window_days=win,
+                    )
+                    val_acc = metrics.get("val_accuracy", float("nan"))
+                    val_auc = metrics.get("val_auc", float("nan"))
+                except Exception:
+                    # If something blows up, record NaNs and continue
+                    model = None
+                    val_acc = float("nan")
+                    val_auc = float("nan")
+                    metrics = {"val_accuracy": val_acc, "val_auc": val_auc}
+
+                rows.append(
+                    {
+                        "train_ratio": float(tr),
+                        "recency_half_life": float(hl),
+                        "recency_window_days": float(win),
+                        "val_accuracy": val_acc,
+                        "val_auc": val_auc,
+                    }
+                )
+
+                # Track best by validation accuracy
+                if not np.isnan(val_acc) and val_acc > best_val_acc and model is not None:
+                    best_val_acc = val_acc
+                    best_model = model
+                    best_metrics = metrics
+                    best_cfg = {
+                        "train_ratio": float(tr),
+                        "recency_half_life": float(hl),
+                        "recency_window_days": float(win),
+                    }
+
+    if best_model is None:
+        raise ValueError("Hyperparameter search did not produce a valid model. Check your data.")
+
+    search_df = pd.DataFrame(rows)
+    return best_model, best_metrics, best_cfg, search_df
+
+
 def ens_build_number_profiles(df: pd.DataFrame, lottery_key: str, recency_mode: bool):
     """
     Weekly / monthly probability profiles.
@@ -874,6 +939,8 @@ if "built_df" not in st.session_state:
     st.session_state["cb_range_metrics"] = None
     st.session_state["ens_model"] = None
     st.session_state["ens_metrics"] = None
+    st.session_state["ens_model_config"] = None
+    st.session_state["ens_runs"] = []
 
 analyze_clicked = st.button("Analyze & Prepare Data")
 
@@ -893,6 +960,8 @@ if uploaded and analyze_clicked:
         st.session_state["cb_range_metrics"] = None
         st.session_state["ens_model"] = None
         st.session_state["ens_metrics"] = None
+        st.session_state["ens_model_config"] = None
+        st.session_state["ens_runs"] = []
         print(f"Parsed {count_dates} unique dates from CSV.")
     except Exception as e:
         print(f"Error parsing CSV: {e}")
@@ -1125,6 +1194,9 @@ with tab2:
         st.markdown("---")
         st.subheader("1) Train Ensemble Model (CatBoost replacement)")
 
+        if "ens_runs" not in st.session_state:
+            st.session_state["ens_runs"] = []
+
         ens_train_ratio = st.slider(
             "Train/Validation split (chronological)",
             min_value=0.6,
@@ -1145,6 +1217,26 @@ with tab2:
                 )
                 st.session_state["ens_model"] = model
                 st.session_state["ens_metrics"] = metrics
+                st.session_state["ens_model_config"] = {
+                    "lottery_choice": lottery_choice,
+                    "lottery_key": lottery_key,
+                    "train_ratio": float(ens_train_ratio),
+                    "recency_half_life": float(recency_half_life),
+                    "recency_window_days": float(recency_window_days),
+                }
+
+                # Log this run
+                st.session_state["ens_runs"].append(
+                    {
+                        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+                        "lottery": lottery_choice,
+                        "train_ratio": float(ens_train_ratio),
+                        "recency_half_life": float(recency_half_life),
+                        "recency_window_days": float(recency_window_days),
+                        "val_accuracy": float(metrics["val_accuracy"]) if not np.isnan(metrics["val_accuracy"]) else None,
+                        "val_auc": float(metrics["val_auc"]) if not np.isnan(metrics["val_auc"]) else None,
+                    }
+                )
 
             m = metrics
             mcols = st.columns(4)
@@ -1161,14 +1253,70 @@ with tab2:
                 f"scale_pos_weight: {m['scale_pos_weight']:.2f}"
             )
 
+        # Show training history
+        if st.session_state["ens_runs"]:
+            hist_df = pd.DataFrame(st.session_state["ens_runs"])
+            if "val_accuracy" in hist_df.columns:
+                hist_df = hist_df.sort_values("val_accuracy", ascending=False)
+
+            st.markdown("### Training history (Ensemble CatBoost)")
+            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+        # Auto-search for best model
+        st.markdown("---")
+        st.subheader("Auto-search: Find best Ensemble model (max val accuracy)")
+
+        if st.button("Find best model automatically", key="ens_auto_btn"):
+            with st.spinner("Running small hyperparameter search..."):
+                best_model, best_metrics, best_cfg, search_df = ens_auto_search_best_model(
+                    built_df,
+                    lottery_key,
+                    candidate_train_ratios=[0.7, 0.8, 0.85],
+                    candidate_half_lives=[15.0, 30.0, 60.0],
+                    candidate_windows=[60.0, 90.0, 120.0],
+                )
+
+            # Store best model & config in session_state
+            st.session_state["ens_model"] = best_model
+            st.session_state["ens_metrics"] = best_metrics
+            st.session_state["ens_model_config"] = {
+                "lottery_choice": lottery_choice,
+                "lottery_key": lottery_key,
+                **best_cfg,
+            }
+
+            st.success(
+                f"Best val accuracy: {best_metrics['val_accuracy']*100:.2f}% "
+                f"(AUC: {best_metrics['val_auc']:.4f})\n\n"
+                f"train_ratio={best_cfg['train_ratio']}, "
+                f"half_life={best_cfg['recency_half_life']}, "
+                f"window_days={best_cfg['recency_window_days']}"
+            )
+
+            # Show all tried configs sorted by validation accuracy
+            search_df_sorted = search_df.sort_values("val_accuracy", ascending=False)
+            st.dataframe(search_df_sorted, use_container_width=True, hide_index=True)
+
         ens_model = st.session_state.get("ens_model")
+        ens_model_config = st.session_state.get("ens_model_config", {})
 
         st.markdown("---")
         st.subheader("2) Score numbers 0–99 for a prediction date")
 
         if ens_model is None:
-            st.info("Train the ensemble model first.")
+            st.info("Train the ensemble model first (or run auto-search).")
         else:
+            # Use the recency settings that the current model was trained with (if available)
+            recency_half_life_used = ens_model_config.get("recency_half_life", recency_half_life)
+            recency_window_days_used = ens_model_config.get("recency_window_days", recency_window_days)
+
+            cfg_lottery = ens_model_config.get("lottery_choice")
+            if cfg_lottery is not None and cfg_lottery != lottery_choice:
+                st.warning(
+                    f"Note: current model was trained on lottery '{cfg_lottery}', "
+                    f"but you selected '{lottery_choice}' above."
+                )
+
             # Default prediction date: day after last data date
             last_date = built_df["date"].max().date()
             default_pred_date = last_date + timedelta(days=1)
@@ -1194,8 +1342,8 @@ with tab2:
                             prob_mode=prob_mode,
                             prob_weight_coeff=float(prob_weight),
                             prediction_date=pred_date,
-                            recency_half_life=recency_half_life,
-                            recency_window_days=recency_window_days,
+                            recency_half_life=recency_half_life_used,
+                            recency_window_days=recency_window_days_used,
                             recency_alpha=recency_alpha,
                         )
 
@@ -1313,8 +1461,8 @@ with tab2:
                             prob_mode=prob_mode,
                             prob_weight_coeff=float(prob_weight),
                             prediction_date=d,
-                            recency_half_life=recency_half_life,
-                            recency_window_days=recency_window_days,
+                            recency_half_life=recency_half_life_used,
+                            recency_window_days=recency_window_days_used,
                             recency_alpha=recency_alpha,
                         )
 
