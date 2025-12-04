@@ -1579,6 +1579,7 @@ with tab3:
             "*Trained on the union of **DR, FB, GZ/GB, GL** for each date (Any lottery hit counts as a hit).*"
         )
 
+        # --- Recency options (same semantics as single-lottery tab) ---
         recency_half_life_all = 30.0
         recency_window_days_all = 90.0
         recency_alpha_all = 0.7
@@ -1645,6 +1646,7 @@ with tab3:
             key="ens_all_train_ratio",
         )
 
+        # Manual combined training (for forward predictions / inspection)
         if st.button("Train Combined Ensemble Model (CatBoost)", key="ens_all_train_btn"):
             with st.spinner("Training combined CatBoost ensemble model (0–99, all lotteries)..."):
                 model_all, metrics_all = ens_train_catboost(
@@ -1686,6 +1688,7 @@ with tab3:
                 f"scale_pos_weight: {m_all['scale_pos_weight']:.2f}"
             )
 
+        # Auto-search best combined model config (global)
         if st.button("Auto-search best Combined Ensemble model (max val accuracy)", key="ens_all_auto_btn"):
             with st.spinner("Searching over train split + recency hyperparameters (combined)..."):
                 best_model_all, best_config_all, hist_df_all = ens_auto_search_best_model(
@@ -1789,6 +1792,7 @@ with tab3:
                             tier = "Core"
                         elif idx < core_count_all + mid_count_all:
                             tier = "Mid"
+                            ￼
                         else:
                             tier = "Edge"
 
@@ -1820,225 +1824,164 @@ with tab3:
                         f"blend={prob_weight_all:.2f}."
                     )
 
-        if ens_all_model is not None:
-            st.markdown("---")
-            st.subheader("3) Backtest combined ensemble vs actual results (date range)")
+        # --- NEW: Strict walk-forward backtest (no future leakage) ---
+        st.markdown("---")
+        st.subheader("3) Backtest combined ensemble vs actual results (walk-forward, no future leakage)")
 
-            eval_min_date_all = combined_df["date"].min().date()
-            eval_max_date_all = combined_df["date"].max().date()
+        eval_min_date_all = combined_df["date"].min().date()
+        eval_max_date_all = combined_df["date"].max().date()
 
-            eval_date_sel_all = st.date_input(
-                "Evaluation date range (for backtesting, combined)",
-                (eval_min_date_all, eval_max_date_all),
-                min_value=eval_min_date_all,
-                max_value=eval_max_date_all,
-                key="ens_all_eval_range",
-            )
+        eval_date_sel_all = st.date_input(
+            "Evaluation date range (for backtesting, combined)",
+            (eval_min_date_all, eval_max_date_all),
+            min_value=eval_min_date_all,
+            max_value=eval_max_date_all,
+            key="ens_all_eval_range",
+        )
 
-            if isinstance(eval_date_sel_all, tuple) and len(eval_date_sel_all) == 2:
-                eval_start_all, eval_end_all = eval_date_sel_all
-            else:
-                eval_start_all = eval_end_all = eval_date_sel_all
+        if isinstance(eval_date_sel_all, tuple) and len(eval_date_sel_all) == 2:
+            eval_start_all, eval_end_all = eval_date_sel_all
+        else:
+            eval_start_all = eval_end_all = eval_date_sel_all
 
-            if eval_start_all > eval_end_all:
-                st.error("Evaluation start date is after end date (combined).")
-            else:
-                eff_rec_half_bt_all = recency_half_life_all
-                eff_rec_window_bt_all = recency_window_days_all
-                if ens_all_cfg is not None:
-                    eff_rec_half_bt_all = float(ens_all_cfg.get("recency_half_life", eff_rec_half_bt_all))
-                    eff_rec_window_bt_all = float(ens_all_cfg.get("recency_window_days", eff_rec_window_bt_all))
+        if eval_start_all > eval_end_all:
+            st.error("Evaluation start date is after end date (combined).")
+        else:
+            # Use trained config if available; otherwise fall back to current UI settings
+            eff_rec_half_bt_all = recency_half_life_all
+            eff_rec_window_bt_all = recency_window_days_all
+            train_ratio_bt_all = ens_all_train_ratio
+            if ens_all_cfg is not None:
+                eff_rec_half_bt_all = float(ens_all_cfg.get("recency_half_life", eff_rec_half_bt_all))
+                eff_rec_window_bt_all = float(ens_all_cfg.get("recency_window_days", eff_rec_window_bt_all))
+                train_ratio_bt_all = float(ens_all_cfg.get("train_ratio", train_ratio_bt_all))
 
-                if st.button("Run combined ensemble backtest", key="ens_all_backtest_btn"):
-                    total_calendar_days_all = (eval_end_all - eval_start_all).days + 1
-                    dates_with_data_all = 0
-                    total_hits_all_all = 0
-                    core_hits_total_all = 0
-                    core_mid_hits_total_all = 0
+            if st.button("Run combined ensemble backtest (walk-forward)", key="ens_all_backtest_btn"):
+                total_calendar_days_all = (eval_end_all - eval_start_all).days + 1
+                dates_with_data_all = 0
+                total_hits_all_all = 0
+                core_hits_total_all = 0
+                core_mid_hits_total_all = 0
 
-                    detail_rows_all = []
+                detail_rows_all = []
 
-                    for offset in range(total_calendar_days_all):
-                        d_all = eval_start_all + timedelta(days=offset)
+                for offset in range(total_calendar_days_all):
+                    d_all = eval_start_all + timedelta(days=offset)
 
-                        mask_day_all = combined_df["date"].dt.date == d_all
-                        if not mask_day_all.any():
+                    # Actual combined results for day d_all
+                    mask_day_all = combined_df["date"].dt.date == d_all
+                    if not mask_day_all.any():
+                        continue
+
+                    row_all = combined_df.loc[mask_day_all].iloc[0]
+                    actual_arr_all = row_all[lottery_key_all] if isinstance(row_all[lottery_key_all], list) else []
+                    actual_set_all = set()
+                    for x in actual_arr_all:
+                        try:
+                            v = int(x)
+                        except Exception:
                             continue
+                        if 0 <= v <= 99:
+                            actual_set_all.add(v)
 
-                        row_all = combined_df.loc[mask_day_all].iloc[0]
-                        actual_arr_all = row_all[lottery_key_all] if isinstance(row_all[lottery_key_all], list) else []
-                        actual_set_all = set()
-                        for x in actual_arr_all:
-                            try:
-                                v = int(x)
-                            except Exception:
-                                continue
-                            if 0 <= v <= 99:
-                                actual_set_all.add(v)
+                    if not actual_set_all:
+                        continue
 
-                        if not actual_set_all:
-                            continue
+                    # History strictly before d_all
+                    history_mask_all_bt = combined_df["date"].dt.date < d_all
+                    history_df_all_bt = combined_df.loc[history_mask_all_bt].copy()
+                    if history_df_all_bt.empty:
+                        continue
 
-                        history_mask_all_bt = combined_df["date"].dt.date < d_all
-                        history_df_all_bt = combined_df.loc[history_mask_all_bt].copy()
-                        if history_df_all_bt.empty:
-                            continue
-
-                        dates_with_data_all += 1
-
-                        scored_sorted_all_bt = ens_score_numbers_for_date(
-                            ens_all_model,
+                    # Train a fresh model on history only (no future leakage)
+                    try:
+                        model_d, metrics_d = ens_train_catboost(
                             history_df_all_bt,
                             lottery_key=lottery_key_all,
-                            prob_mode=prob_mode_all,
-                            prob_weight_coeff=float(prob_weight_all),
-                            prediction_date=d_all,
+                            train_ratio=train_ratio_bt_all,
                             recency_half_life=eff_rec_half_bt_all,
                             recency_window_days=eff_rec_window_bt_all,
-                            recency_alpha=recency_alpha_all,
                         )
+                    except Exception:
+                        # If model training fails (edge cases), skip this date
+                        continue
 
-                        top_list_all_bt = scored_sorted_all_bt[: int(top_n_all)]
+                    dates_with_data_all += 1
 
-                        core_hits_all = 0
-                        mid_hits_all = 0
-                        edge_hits_all = 0
+                    # Score this date using only that history + newly trained model
+                    scored_sorted_all_bt = ens_score_numbers_for_date(
+                        model_d,
+                        history_df_all_bt,
+                        lottery_key=lottery_key_all,
+                        prob_mode=prob_mode_all,
+                        prob_weight_coeff=float(prob_weight_all),
+                        prediction_date=d_all,
+                        recency_half_life=eff_rec_half_bt_all,
+                        recency_window_days=eff_rec_window_bt_all,
+                        recency_alpha=recency_alpha_all,
+                    )
 
-                        for idx, item in enumerate(top_list_all_bt):
-                            num = item["number"]
-                            if num in actual_set_all:
-                                if idx < core_count_all:
-                                    core_hits_all += 1
-                                elif idx < core_count_all + mid_count_all:
-                                    mid_hits_all += 1
-                                else:
-                                    edge_hits_all += 1
+                    top_list_all_bt = scored_sorted_all_bt[: int(top_n_all)]
 
-                        day_total_hits_all = core_hits_all + mid_hits_all + edge_hits_all
-                        total_hits_all_all += day_total_hits_all
-                        core_hits_total_all += core_hits_all
-                        core_mid_hits_total_all += core_hits_all + mid_hits_all
+                    core_hits_all = 0
+                    mid_hits_all = 0
+                    edge_hits_all = 0
 
-                        detail_rows_all.append(
-                            {
-                                "Date": d_all.isoformat(),
-                                "Day": row_all["dow_label"],
-                                "Actual (ALL lotteries)": " ".join(str(n) for n in sorted(actual_set_all)),
-                                "Core Hits": core_hits_all,
-                                "Mid Hits": mid_hits_all,
-                                "Edge Hits": edge_hits_all,
-                                "Total Hits": day_total_hits_all,
-                            }
+                    for idx, item in enumerate(top_list_all_bt):
+                        num = item["number"]
+                        if num in actual_set_all:
+                            if idx < core_count_all:
+                                core_hits_all += 1
+                            elif idx < core_count_all + mid_count_all:
+                                mid_hits_all += 1
+                            else:
+                                edge_hits_all += 1
+
+                    day_total_hits_all = core_hits_all + mid_hits_all + edge_hits_all
+                    total_hits_all_all += day_total_hits_all
+                    core_hits_total_all += core_hits_all
+                    core_mid_hits_total_all += core_hits_all + mid_hits_all
+
+                    detail_rows_all.append(
+                        {
+                            "Date": d_all.isoformat(),
+                            "Day": row_all["dow_label"],
+                            "Actual (ALL lotteries)": " ".join(str(n) for n in sorted(actual_set_all)),
+                            "Core Hits": core_hits_all,
+                            "Mid Hits": mid_hits_all,
+                            "Edge Hits": edge_hits_all,
+                            "Total Hits": day_total_hits_all,
+                        }
+                    )
+
+                if dates_with_data_all == 0:
+                    st.warning("No dates with actual data / trainable history for combined backtesting.")
+                else:
+                    avg_hits_per_date_all = total_hits_all_all / dates_with_data_all
+                    core_hit_rate_all = (core_hits_total_all / dates_with_data_all) * 100.0
+                    core_mid_hit_rate_all = (core_mid_hits_total_all / dates_with_data_all) * 100.0
+                    any_tier_hit_rate_all = (total_hits_all_all / dates_with_data_all) * 100.0
+
+                    m1_all, m2_all, m3_all, m4_all = st.columns(4)
+                    m1_all.metric("Dates in range", total_calendar_days_all)
+                    m2_all.metric("Dates with data (trainable)", dates_with_data_all)
+                    m3_all.metric("Total hits (all tiers, combined)", total_hits_all_all)
+                    m4_all.metric("Avg hits / date (combined)", f"{avg_hits_per_date_all:.2f}")
+
+                    n1_all, n2_all, n3_all, n4_all = st.columns(4)
+                    n1_all.metric("Core hit rate (combined)", f"{core_hit_rate_all:.1f}%")
+                    n2_all.metric("Core+Mid hit rate (combined)", f"{core_mid_hit_rate_all:.1f}%")
+                    n3_all.metric("Any tier hit rate (combined)", f"{any_tier_hit_rate_all:.1f}%")
+                    n4_all.metric("Lottery", "ALL (combined)")
+
+                    if detail_rows_all:
+                        detail_df_all = pd.DataFrame(detail_rows_all)
+                        st.dataframe(detail_df_all, use_container_width=True, hide_index=True)
+
+                        csv_bytes_all_bt = detail_df_all.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "Download combined backtest details as CSV",
+                            data=csv_bytes_all_bt,
+                            file_name="ensemble_backtest_details_combined_walkforward.csv",
+                            mime="text/csv",
                         )
-
-                    if dates_with_data_all == 0:
-                        st.warning("No dates with actual data found in this range for combined backtesting.")
-                    else:
-                        avg_hits_per_date_all = total_hits_all_all / dates_with_data_all
-                        core_hit_rate_all = (core_hits_total_all / dates_with_data_all) * 100.0
-                        core_mid_hit_rate_all = (core_mid_hits_total_all / dates_with_data_all) * 100.0
-                        any_tier_hit_rate_all = (total_hits_all_all / dates_with_data_all) * 100.0
-
-                        m1_all, m2_all, m3_all, m4_all = st.columns(4)
-                        m1_all.metric("Dates in range", total_calendar_days_all)
-                        m2_all.metric("Dates with actual data", dates_with_data_all)
-                        m3_all.metric("Total hits (all tiers, combined)", total_hits_all_all)
-                        m4_all.metric("Avg hits / date (past only, combined)", f"{avg_hits_per_date_all:.2f}")
-
-                        n1_all, n2_all, n3_all, n4_all = st.columns(4)
-                        n1_all.metric("Core hit rate (combined)", f"{core_hit_rate_all:.1f}%")
-                        n2_all.metric("Core+Mid hit rate (combined)", f"{core_mid_hit_rate_all:.1f}%")
-                        n3_all.metric("Any tier hit rate (combined)", f"{any_tier_hit_rate_all:.1f}%")
-                        n4_all.metric("Lottery", "ALL (combined)")
-
-                        if detail_rows_all:
-                            detail_df_all = pd.DataFrame(detail_rows_all)
-                            st.dataframe(detail_df_all, use_container_width=True, hide_index=True)
-
-                            csv_bytes_all_bt = detail_df_all.to_csv(index=False).encode("utf-8")
-                            st.download_button(
-                                "Download combined backtest details as CSV",
-                                data=csv_bytes_all_bt,
-                                file_name="ensemble_backtest_details_combined.csv",
-                                mime="text/csv",
-                            )
-
-# ==================== Global Date Range Lookup ==================== #
-
-st.markdown("---")
-st.subheader("Date Range Lookup — WIN status for your Range/Custom")
-
-if built_df is None or built_df.empty:
-    st.info("Upload a CSV and click **Analyze & Prepare Data** first to use the lookup.")
-else:
-    rmin, rmax = st.session_state["range"]
-    custom_set = st.session_state["custom_set"]
-    custom_only = st.session_state["custom_only"]
-
-    min_date = built_df["date"].min().date()
-    max_date = built_df["date"].max().date()
-
-    st.caption(
-        f"Current settings → Range: `{rmin}-{rmax}`, "
-        f"Custom: {sorted(list(custom_set)) or 'None'}, "
-        f"Mode: {'Custom only' if custom_only else 'Range + Custom'}"
-    )
-
-    date_selection = st.date_input(
-        "Select date range",
-        (min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
-        key="lookup_range",
-    )
-
-    if isinstance(date_selection, tuple) and len(date_selection) == 2:
-        start_date, end_date = date_selection
-    else:
-        start_date = end_date = date_selection
-
-    if start_date > end_date:
-        st.error("Start date is after end date. Please fix the range.")
-    else:
-        if st.button("Run Lookup", key="lookup_btn"):
-            mask = (
-                (built_df["date"].dt.date >= start_date)
-                & (built_df["date"].dt.date <= end_date)
-            )
-            df_range = built_df.loc[mask].copy()
-
-            if df_range.empty:
-                st.warning("No records found in this date range.")
-            else:
-                lookup_table = pd.DataFrame(
-                    {
-                        "Date": df_range["date_key"],
-                        "Day": df_range["dow_label"],
-                        "DR": df_range["DR"].apply(format_nums),
-                        "DR Status": np.where(df_range["DR_win"], "WIN", "NOT WIN"),
-                        "FB": df_range["FB"].apply(format_nums),
-                        "FB Status": np.where(df_range["FB_win"], "WIN", "NOT WIN"),
-                        "GZ/GB": df_range["GZGB"].apply(format_nums),
-                        "GZ/GB Status": np.where(df_range["GZGB_win"], "WIN", "NOT WIN"),
-                        "GL": df_range["GL"].apply(format_nums),
-                        "GL Status": np.where(df_range["GL_win"], "WIN", "NOT WIN"),
-                        "Any WIN": np.where(df_range["any_win"], "WIN", "NOT WIN"),
-                    }
-                )
-
-                wins_in_range = int(df_range["any_win"].sum())
-                total_in_range = len(df_range)
-                st.metric(
-                    "WIN days in this range",
-                    f"{wins_in_range} / {total_in_range}",
-                )
-
-                st.dataframe(lookup_table, use_container_width=True, hide_index=True)
-
-                csv_bytes = lookup_table.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download lookup result as CSV",
-                    data=csv_bytes,
-                    file_name="date_range_lookup.csv",
-                    mime="text/csv",
-                )
