@@ -1792,7 +1792,6 @@ with tab3:
                             tier = "Core"
                         elif idx < core_count_all + mid_count_all:
                             tier = "Mid"
-                            ￼
                         else:
                             tier = "Edge"
 
@@ -1985,3 +1984,4 @@ with tab3:
                             file_name="ensemble_backtest_details_combined_walkforward.csv",
                             mime="text/csv",
                         )
+
