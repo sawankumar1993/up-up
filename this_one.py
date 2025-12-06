@@ -1989,8 +1989,12 @@ with tab3:
 # ============================================================
 
 import io
+from datetime import timedelta  # used for "next draw" default date
 
 # ---------- Small helpers (local to this section) ---------- #
+
+WINDOWS_PARITY_RANGE = [5, 10, 20, 50]
+
 
 def detect_delimiter_simple(first_line: str) -> str:
     """
@@ -2029,7 +2033,7 @@ def ensure_draw_date_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Tries to create/standardize a 'draw_date' column.
     Handles:
-    - A single 'date'/'drawdate'/'draw_date'/'draw date' column, or
+    - a single 'date'/'drawdate'/'draw_date'/'draw date' column, or
     - year/month/day style columns, or
     - falls back to synthetic chronological index if needed.
     Returns a *new* DataFrame with 'draw_date' and sorted by it.
@@ -2071,7 +2075,6 @@ def ensure_draw_date_column(df: pd.DataFrame) -> pd.DataFrame:
                 df["draw_date"] = pd.to_datetime(temp, errors="coerce")
             else:
                 # Absolute fallback: synthetic date based on row index
-                # Still chronological, just not tied to real calendar.
                 base = pd.Timestamp("2000-01-01")
                 df["draw_date"] = base + pd.to_timedelta(range(len(df)), unit="D")
 
@@ -2134,7 +2137,6 @@ def prepare_lottery_dataset_for_parity_range(
     Returns:
         df_feat, feature_cols
     """
-    # Standardize date column
     df = ensure_draw_date_column(df_raw)
 
     if lottery_col not in df.columns:
@@ -2155,14 +2157,12 @@ def prepare_lottery_dataset_for_parity_range(
     df["target_parity"] = parity
     df["target_range"]  = high
     # Combine into 4 classes:
-    # class = parity + 2*high
     # 0: even+low, 1: odd+low, 2: even+high, 3: odd+high
     df["target_4class"] = parity + 2 * high
 
     # ---------- Leak-free historical features ---------- #
     # Use only PAST info via shift(1).
 
-    # Past odd / high flags
     odd_prev  = parity.shift(1).fillna(0).astype(int)
     high_prev = high.shift(1).fillna(0).astype(int)
 
@@ -2170,8 +2170,7 @@ def prepare_lottery_dataset_for_parity_range(
     df["feat_high_prev"] = high_prev
 
     # Rolling ratios of odd/high over windows of 5, 10, 20, 50 past draws
-    windows = [5, 10, 20, 50]
-    for w in windows:
+    for w in WINDOWS_PARITY_RANGE:
         df[f"feat_odd_ratio_{w}"] = (
             parity.shift(1).rolling(window=w, min_periods=1).mean()
         )
@@ -2258,6 +2257,210 @@ def compute_multiclass_metrics(y_true, prob_matrix) -> dict:
     return {"accuracy": acc, "logloss": logloss}
 
 
+def walk_forward_binary_backtest(
+    df: pd.DataFrame,
+    feat_cols: list,
+    target_col: str,
+    max_test_points: int = 80,
+) -> tuple[dict, pd.DataFrame]:
+    """
+    Walk-forward expanding-window backtest for a binary target.
+    - Train on rows [0 : idx), test on row idx, for a set of idx's
+    - Only uses *past* rows for each prediction
+    Limits to at most `max_test_points` test rows (latest ones).
+    Returns:
+        metrics dict, and a DataFrame with per-draw results.
+    """
+    n = len(df)
+    if n < 80:
+        raise ValueError(f"Need at least ~80 rows for a meaningful walk-forward test (got {n}).")
+
+    # Start training after at least 50 rows
+    min_train_size = max(50, int(n * 0.4))
+    test_indices = list(range(min_train_size, n))
+
+    if len(test_indices) > max_test_points:
+        test_indices = test_indices[-max_test_points:]  # focus on most recent segment
+
+    y_true = []
+    prob1_list = []
+    dates = []
+    values = []
+
+    for idx in test_indices:
+        train_df = df.iloc[:idx]
+        test_row = df.iloc[idx:idx + 1]
+
+        X_train = train_df[feat_cols]
+        y_train = train_df[target_col]
+        X_test  = test_row[feat_cols]
+
+        model = CatBoostClassifier(
+            loss_function="Logloss",
+            depth=6,
+            learning_rate=0.05,
+            n_estimators=200,
+            random_seed=100 + idx,
+            verbose=False,
+        )
+        model.fit(X_train, y_train, verbose=False)
+        prob1 = model.predict_proba(X_test)[0, 1]
+
+        y_true.append(int(test_row[target_col].iloc[0]))
+        prob1_list.append(float(prob1))
+        dates.append(test_row["draw_date"].iloc[0])
+        values.append(int(test_row["lottery_value"].iloc[0]))
+
+    metrics = compute_binary_metrics(y_true, prob1_list)
+
+    results_df = pd.DataFrame(
+        {
+            "draw_date": dates,
+            "lottery_value": values,
+            f"actual_{target_col}": y_true,
+            f"pred_p1_{target_col}": np.round(prob1_list, 4),
+        }
+    )
+    return metrics, results_df
+
+
+def walk_forward_multiclass_backtest(
+    df: pd.DataFrame,
+    feat_cols: list,
+    max_test_points: int = 60,
+) -> tuple[dict, pd.DataFrame]:
+    """
+    Walk-forward expanding-window backtest for the 4-class target.
+    - Train on rows [0 : idx), test on row idx
+    Limits to at most `max_test_points` test rows (latest ones).
+    Returns:
+        metrics dict, and a DataFrame with per-draw results.
+    """
+    n = len(df)
+    if n < 80:
+        raise ValueError(f"Need at least ~80 rows for a meaningful walk-forward test (got {n}).")
+
+    min_train_size = max(50, int(n * 0.4))
+    test_indices = list(range(min_train_size, n))
+    if len(test_indices) > max_test_points:
+        test_indices = test_indices[-max_test_points:]
+
+    y_true = []
+    dates = []
+    values = []
+    all_probs = []
+
+    for idx in test_indices:
+        train_df = df.iloc[:idx]
+        test_row = df.iloc[idx:idx + 1]
+
+        X_train = train_df[feat_cols]
+        y_train = train_df["target_4class"]
+        X_test  = test_row[feat_cols]
+
+        model = CatBoostClassifier(
+            loss_function="MultiClass",
+            depth=6,
+            learning_rate=0.05,
+            n_estimators=250,
+            random_seed=200 + idx,
+            verbose=False,
+        )
+        model.fit(X_train, y_train, verbose=False)
+        prob_vec = model.predict_proba(X_test)[0]
+
+        y_true.append(int(test_row["target_4class"].iloc[0]))
+        dates.append(test_row["draw_date"].iloc[0])
+        values.append(int(test_row["lottery_value"].iloc[0]))
+        all_probs.append(prob_vec)
+
+    prob_matrix = np.vstack(all_probs)
+    metrics = compute_multiclass_metrics(y_true, prob_matrix)
+
+    results_df = pd.DataFrame(
+        {
+            "draw_date": dates,
+            "lottery_value": values,
+            "actual_4class": y_true,
+        }
+    )
+    for cls in range(4):
+        results_df[f"p_cls_{cls}"] = np.round(prob_matrix[:, cls], 4)
+
+    return metrics, results_df
+
+
+def build_next_feature_row(
+    df: pd.DataFrame,
+    feat_cols: list,
+    next_date=None,
+) -> pd.DataFrame:
+    """
+    Build a single feature row for the *next* draw, based on all past draws.
+    Uses the same logic as prepare_lottery_dataset_for_parity_range, but in 1-row form.
+    """
+    if len(df) == 0:
+        raise ValueError("No rows available to build next-draw features.")
+
+    df_sorted = df.sort_values("draw_date").reset_index(drop=True)
+    dt_last = df_sorted["draw_date"].iloc[-1]
+
+    if next_date is None:
+        next_draw_date = dt_last + pd.Timedelta(days=1)
+    else:
+        next_draw_date = pd.to_datetime(next_date)
+
+    parity = df_sorted["target_parity"].astype(int).values
+    high   = df_sorted["target_range"].astype(int).values
+    n = len(df_sorted)
+
+    last_parity = parity[-1]
+    last_high   = high[-1]
+
+    # Previous flags for next row = last draw's actual class
+    feat_odd_prev  = last_parity
+    feat_high_prev = last_high
+
+    # Rolling ratios over WINDOWS_PARITY_RANGE
+    feat = {}
+    feat["feat_odd_prev"]  = feat_odd_prev
+    feat["feat_high_prev"] = feat_high_prev
+
+    for w in WINDOWS_PARITY_RANGE:
+        start_idx = max(0, n - w)
+        feat[f"feat_odd_ratio_{w}"] = float(parity[start_idx:n].mean())
+        feat[f"feat_high_ratio_{w}"] = float(high[start_idx:n].mean())
+
+    # Streaks: use existing streaks to extend
+    # streak_prev at last row counts streak in parity up to index n-2; so extend by last_parity
+    last_odd_streak_prev  = int(df_sorted["feat_odd_streak_prev"].iloc[-1])
+    last_high_streak_prev = int(df_sorted["feat_high_streak_prev"].iloc[-1])
+
+    if last_parity == 1:
+        feat["feat_odd_streak_prev"] = last_odd_streak_prev + 1
+    else:
+        feat["feat_odd_streak_prev"] = 0
+
+    if last_high == 1:
+        feat["feat_high_streak_prev"] = last_high_streak_prev + 1
+    else:
+        feat["feat_high_streak_prev"] = 0
+
+    # Calendar features
+    feat["feat_year"]           = next_draw_date.year
+    feat["feat_month"]          = next_draw_date.month
+    feat["feat_day"]            = next_draw_date.day
+    feat["feat_dow"]            = next_draw_date.weekday()
+    feat["feat_is_month_start"] = int(next_draw_date.is_month_start)
+    feat["feat_is_month_end"]   = int(next_draw_date.is_month_end)
+
+    # Build DataFrame and order cols exactly like feat_cols
+    row_df = pd.DataFrame([feat])
+    # In case feat_cols include any extras (shouldn't), reindex with fill_value=0
+    row_df = row_df.reindex(columns=feat_cols, fill_value=0)
+    return row_df
+
+
 FOUR_CLASS_LABELS = {
     0: "Even & Low (0–49 even)",
     1: "Odd & Low (0–49 odd)",
@@ -2286,7 +2489,7 @@ else:
         df_cls_raw = None
 
     if df_cls_raw is not None:
-        # Detect available lotteries
+        # Detect available lotteries (DR, FB, SG, GZ, GL, GB)
         lottery_cols = get_lottery_columns(df_cls_raw)
         if not lottery_cols:
             st.error(
@@ -2329,6 +2532,9 @@ else:
                     df_cls = None
 
                 if df_cls is not None:
+                    last_date = df_cls["draw_date"].max()
+                    default_next_date = (last_date + timedelta(days=1)).date()
+
                     tab_bin, tab_four = st.tabs(
                         [
                             "Binary Parity & Range (Strategy B)",
@@ -2346,8 +2552,9 @@ else:
                             "All features are based only on *past* draws for this lottery."
                         )
 
+                        # --- Simple chronological split backtest --- #
                         if st.button(
-                            f"Train & Evaluate Binary Models for {chosen_lottery}",
+                            f"Train & Evaluate (Chrono Split) – {chosen_lottery}",
                             key="btn_train_binary_parity_range",
                         ):
                             try:
@@ -2392,14 +2599,13 @@ else:
                                     y_range_test, prob_range_test
                                 )
 
-                                st.markdown("#### Results – Parity (Odd vs Even)")
+                                st.markdown("#### Chronological Split – Parity (Odd vs Even)")
                                 st.write(
                                     f"**Accuracy**: {metrics_parity['accuracy']:.3f}  \n"
                                     f"**Brier score**: {metrics_parity['brier']:.4f}  \n"
                                     f"**Logloss**: {metrics_parity['logloss']:.4f}"
                                 )
 
-                                # Small parity confusion matrix
                                 y_par_pred = (prob_parity_test >= 0.5).astype(int)
                                 cm_par = pd.crosstab(
                                     pd.Series(y_parity_test, name="Actual"),
@@ -2409,7 +2615,7 @@ else:
                                 st.dataframe(cm_par)
 
                                 st.markdown("---")
-                                st.markdown("#### Results – Range (0–49 Low vs 50–99 High)")
+                                st.markdown("#### Chronological Split – Range (0–49 Low vs 50–99 High)")
                                 st.write(
                                     f"**Accuracy**: {metrics_range['accuracy']:.3f}  \n"
                                     f"**Brier score**: {metrics_range['brier']:.4f}  \n"
@@ -2425,7 +2631,7 @@ else:
                                 st.dataframe(cm_rng)
 
                                 # Show last few test rows with predictions for inspection
-                                st.markdown("#### Sample of test rows with predictions")
+                                st.markdown("#### Sample of test rows with predictions (Chrono Split)")
                                 sample_show = test_df[["draw_date", "lottery_value"]].copy()
                                 sample_show["Actual Parity (0=Even,1=Odd)"] = y_parity_test.values
                                 sample_show["Pred P(odd)"] = np.round(prob_parity_test, 3)
@@ -2434,7 +2640,125 @@ else:
                                 st.dataframe(sample_show.tail(20))
 
                             except Exception as e:
-                                st.error(f"Error training/evaluating binary models: {e}")
+                                st.error(f"Error training/evaluating binary models (chrono split): {e}")
+
+                        st.markdown("----")
+                        st.markdown("### Walk-Forward Backtest (Binary Models)")
+
+                        max_walk_tests = st.slider(
+                            "Max walk-forward test points (latest draws)",
+                            min_value=30,
+                            max_value=200,
+                            value=80,
+                            step=10,
+                            key="max_walk_binary",
+                        )
+
+                        if st.button(
+                            f"Run Walk-Forward Backtest – {chosen_lottery}",
+                            key="btn_walk_forward_binary",
+                        ):
+                            try:
+                                # Parity walk-forward
+                                m_parity_wf, df_parity_wf = walk_forward_binary_backtest(
+                                    df_cls, feat_cols, "target_parity", max_test_points=max_walk_tests
+                                )
+                                # Range walk-forward
+                                m_range_wf, df_range_wf = walk_forward_binary_backtest(
+                                    df_cls, feat_cols, "target_range", max_test_points=max_walk_tests
+                                )
+
+                                st.markdown("#### Walk-Forward – Parity (Odd vs Even)")
+                                st.write(
+                                    f"**Accuracy**: {m_parity_wf['accuracy']:.3f}  \n"
+                                    f"**Brier score**: {m_parity_wf['brier']:.4f}  \n"
+                                    f"**Logloss**: {m_parity_wf['logloss']:.4f}"
+                                )
+                                st.write("Last few walk-forward parity predictions:")
+                                st.dataframe(df_parity_wf.tail(20))
+
+                                st.markdown("---")
+                                st.markdown("#### Walk-Forward – Range (0–49 Low vs 50–99 High)")
+                                st.write(
+                                    f"**Accuracy**: {m_range_wf['accuracy']:.3f}  \n"
+                                    f"**Brier score**: {m_range_wf['brier']:.4f}  \n"
+                                    f"**Logloss**: {m_range_wf['logloss']:.4f}"
+                                )
+                                st.write("Last few walk-forward range predictions:")
+                                st.dataframe(df_range_wf.tail(20))
+
+                            except Exception as e:
+                                st.error(f"Error in walk-forward binary backtest: {e}")
+
+                        st.markdown("----")
+                        st.markdown("### Predict Next Draw (Binary Models)")
+
+                        next_date_bin = st.date_input(
+                            "Next draw date for prediction",
+                            value=default_next_date,
+                            key="next_date_binary",
+                            help="Used for calendar features; history-based features use all past draws.",
+                        )
+
+                        if st.button(
+                            f"Train on all past data & predict next draw – {chosen_lottery}",
+                            key="btn_predict_next_binary",
+                        ):
+                            try:
+                                X_all = df_cls[feat_cols]
+                                y_par_all = df_cls["target_parity"]
+                                y_rng_all = df_cls["target_range"]
+
+                                # Train full-history models
+                                model_par_full = CatBoostClassifier(
+                                    loss_function="Logloss",
+                                    depth=6,
+                                    learning_rate=0.05,
+                                    n_estimators=350,
+                                    random_seed=500,
+                                    verbose=False,
+                                )
+                                model_par_full.fit(X_all, y_par_all, verbose=False)
+
+                                model_rng_full = CatBoostClassifier(
+                                    loss_function="Logloss",
+                                    depth=6,
+                                    learning_rate=0.05,
+                                    n_estimators=350,
+                                    random_seed=501,
+                                    verbose=False,
+                                )
+                                model_rng_full.fit(X_all, y_rng_all, verbose=False)
+
+                                # Build next feature row
+                                next_feat_row = build_next_feature_row(
+                                    df_cls,
+                                    feat_cols,
+                                    next_date=next_date_bin,
+                                )
+
+                                p_odd = float(model_par_full.predict_proba(next_feat_row)[0, 1])
+                                p_even = 1.0 - p_odd
+                                p_high = float(model_rng_full.predict_proba(next_feat_row)[0, 1])
+                                p_low  = 1.0 - p_high
+
+                                pred_parity = "Odd" if p_odd >= 0.5 else "Even"
+                                pred_range  = "High (50–99)" if p_high >= 0.5 else "Low (0–49)"
+
+                                st.markdown("#### Next Draw Prediction – Binary Models")
+                                st.write(f"**Lottery**: {chosen_lottery}")
+                                st.write(f"**Next draw date**: {next_date_bin.isoformat()}")
+                                st.write(
+                                    f"- Parity → **{pred_parity}**  "
+                                    f"(P(odd) = {p_odd:.3f}, P(even) = {p_even:.3f})"
+                                )
+                                st.write(
+                                    f"- Range  → **{pred_range}**  "
+                                    f"(P(high 50–99) = {p_high:.3f}, P(low 0–49) = {p_low:.3f})"
+                                )
+
+                            except Exception as e:
+                                st.error(f"Error predicting next draw (binary models): {e}")
 
                     # ====== TAB 2: Strategy C – Single 4-Class Model ====== #
                     with tab_four:
@@ -2448,8 +2772,9 @@ else:
                             "You can recover Odd/Even or Low/High probabilities by summing relevant class probabilities."
                         )
 
+                        # --- Simple chronological split backtest --- #
                         if st.button(
-                            f"Train & Evaluate 4-Class Model for {chosen_lottery}",
+                            f"Train & Evaluate (Chrono Split) – 4-Class {chosen_lottery}",
                             key="btn_train_4class_parity_range",
                         ):
                             try:
@@ -2472,7 +2797,7 @@ else:
                                 prob4_test = model4.predict_proba(X_test)
                                 metrics4 = compute_multiclass_metrics(y4_test, prob4_test)
 
-                                st.markdown("#### Results – 4-Class Parity+Range")
+                                st.markdown("#### Chronological Split – 4-Class Parity+Range")
                                 st.write(
                                     f"**Accuracy**: {metrics4['accuracy']:.3f}  \n"
                                     f"**Logloss**: {metrics4['logloss']:.4f}"
@@ -2494,7 +2819,7 @@ else:
                                 st.dataframe(cm4)
 
                                 # Show sample of test rows with probabilities
-                                st.markdown("#### Sample of test rows with 4-class probabilities")
+                                st.markdown("#### Sample of test rows with 4-class probabilities (Chrono Split)")
                                 sample = test_df[["draw_date", "lottery_value"]].copy()
                                 for cls in range(4):
                                     sample[f"P({cls}: {FOUR_CLASS_LABELS[cls]})"] = np.round(
@@ -2503,6 +2828,104 @@ else:
                                 st.dataframe(sample.tail(20))
 
                             except Exception as e:
-                                st.error(f"Error training/evaluating 4-class model: {e}")
+                                st.error(f"Error training/evaluating 4-class model (chrono split): {e}")
 
+                        st.markdown("----")
+                        st.markdown("### Walk-Forward Backtest (4-Class Model)")
+
+                        max_walk_tests_4 = st.slider(
+                            "Max walk-forward test points (latest draws) – 4-class",
+                            min_value=30,
+                            max_value=150,
+                            value=60,
+                            step=10,
+                            key="max_walk_4class",
+                        )
+
+                        if st.button(
+                            f"Run Walk-Forward Backtest – 4-Class {chosen_lottery}",
+                            key="btn_walk_forward_4class",
+                        ):
+                            try:
+                                metrics4_wf, df4_wf = walk_forward_multiclass_backtest(
+                                    df_cls, feat_cols, max_test_points=max_walk_tests_4
+                                )
+
+                                st.markdown("#### Walk-Forward – 4-Class Parity+Range")
+                                st.write(
+                                    f"**Accuracy**: {metrics4_wf['accuracy']:.3f}  \n"
+                                    f"**Logloss**: {metrics4_wf['logloss']:.4f}"
+                                )
+                                st.write("Last few walk-forward 4-class predictions:")
+                                st.dataframe(df4_wf.tail(20))
+
+                            except Exception as e:
+                                st.error(f"Error in walk-forward 4-class backtest: {e}")
+
+                        st.markdown("----")
+                        st.markdown("### Predict Next Draw (4-Class Model)")
+
+                        next_date_4 = st.date_input(
+                            "Next draw date for prediction (4-class)",
+                            value=default_next_date,
+                            key="next_date_4class",
+                        )
+
+                        if st.button(
+                            f"Train on all past data & predict next draw – 4-Class {chosen_lottery}",
+                            key="btn_predict_next_4class",
+                        ):
+                            try:
+                                X_all = df_cls[feat_cols]
+                                y4_all = df_cls["target_4class"]
+
+                                model4_full = CatBoostClassifier(
+                                    loss_function="MultiClass",
+                                    depth=6,
+                                    learning_rate=0.05,
+                                    n_estimators=400,
+                                    random_seed=600,
+                                    verbose=False,
+                                )
+                                model4_full.fit(X_all, y4_all, verbose=False)
+
+                                next_feat_row_4 = build_next_feature_row(
+                                    df_cls,
+                                    feat_cols,
+                                    next_date=next_date_4,
+                                )
+
+                                prob4_next = model4_full.predict_proba(next_feat_row_4)[0]
+
+                                # Decode main class
+                                cls_idx = int(np.argmax(prob4_next))
+                                main_label = FOUR_CLASS_LABELS[cls_idx]
+
+                                # Derive Odd/Even & Low/High from the 4-class distribution
+                                p_even = float(prob4_next[0] + prob4_next[2])
+                                p_odd  = float(prob4_next[1] + prob4_next[3])
+                                p_low  = float(prob4_next[0] + prob4_next[1])
+                                p_high = float(prob4_next[2] + prob4_next[3])
+
+                                st.markdown("#### Next Draw Prediction – 4-Class Model")
+                                st.write(f"**Lottery**: {chosen_lottery}")
+                                st.write(f"**Next draw date**: {next_date_4.isoformat()}")
+                                st.write(f"Most likely 4-class bucket: **{main_label}**")
+                                st.write("Class probabilities:")
+                                for k in range(4):
+                                    st.write(
+                                        f"- {k}: {FOUR_CLASS_LABELS[k]} → {prob4_next[k]:.3f}"
+                                    )
+
+                                st.markdown("Derived Odd/Even & Range probabilities:")
+                                st.write(
+                                    f"- Parity: P(odd) = {p_odd:.3f}, P(even) = {p_even:.3f}"
+                                )
+                                st.write(
+                                    f"- Range:  P(low 0–49) = {p_low:.3f}, "
+                                    f"P(high 50–99) = {p_high:.3f}"
+                                )
+
+                            except Exception as e:
+                                st.error(f"Error predicting next draw (4-class model): {e}")
 
