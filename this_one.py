@@ -1984,4 +1984,525 @@ with tab3:
                             file_name="ensemble_backtest_details_combined_walkforward.csv",
                             mime="text/csv",
                         )
+# ============================================================
+# Parity / Range Models (Strategy B & Strategy C, per lottery)
+# ============================================================
+
+import io
+
+# ---------- Small helpers (local to this section) ---------- #
+
+def detect_delimiter_simple(first_line: str) -> str:
+    """
+    Simple delimiter detection for the classifier CSV uploader.
+    Doesn't touch your existing detect_delimiter().
+    """
+    if "\t" in first_line:
+        return "\t"
+    if ";" in first_line:
+        return ";"
+    if "|" in first_line:
+        return "|"
+    return ","  # default
+
+
+def load_csv_robust_for_classifiers(uploaded_file) -> pd.DataFrame:
+    """
+    Robust CSV loader:
+    - decodes as UTF-8 (ignoring bad chars)
+    - auto-detects delimiter
+    - returns a pandas DataFrame
+    """
+    raw = uploaded_file.read()
+    text = raw.decode("utf-8", errors="ignore")
+    if not text.strip():
+        raise ValueError("Uploaded CSV is empty.")
+
+    lines = text.splitlines()
+    first_line = lines[0]
+    delimiter = detect_delimiter_simple(first_line)
+    df = pd.read_csv(io.StringIO(text), sep=delimiter)
+    return df
+
+
+def ensure_draw_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tries to create/standardize a 'draw_date' column.
+    Handles:
+    - A single 'date'/'drawdate'/'draw_date'/'draw date' column, or
+    - year/month/day style columns, or
+    - falls back to synthetic chronological index if needed.
+    Returns a *new* DataFrame with 'draw_date' and sorted by it.
+    """
+    df = df.copy()
+
+    # Already present?
+    if "draw_date" in df.columns:
+        df["draw_date"] = pd.to_datetime(df["draw_date"], errors="coerce", dayfirst=True)
+    else:
+        # Try a single date-like column
+        date_col = None
+        for col in df.columns:
+            c = col.strip().lower()
+            if c in ("date", "drawdate", "draw_date", "draw date"):
+                date_col = col
+                break
+
+        if date_col is not None:
+            df["draw_date"] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+        else:
+            # Try year / month / day triplet
+            year_col = None
+            month_col = None
+            day_col = None
+            for col in df.columns:
+                c = col.strip().lower()
+                if c in ("year", "yyyy"):
+                    year_col = col
+                elif c in ("month", "mm"):
+                    month_col = col
+                elif c in ("day", "dd", "dom"):
+                    day_col = col
+
+            if year_col and month_col and day_col:
+                temp = df[[year_col, month_col, day_col]].rename(
+                    columns={year_col: "year", month_col: "month", day_col: "day"}
+                )
+                df["draw_date"] = pd.to_datetime(temp, errors="coerce")
+            else:
+                # Absolute fallback: synthetic date based on row index
+                # Still chronological, just not tied to real calendar.
+                base = pd.Timestamp("2000-01-01")
+                df["draw_date"] = base + pd.to_timedelta(range(len(df)), unit="D")
+
+    # Drop rows where date couldn't be parsed at all
+    df = df[df["draw_date"].notna()].copy()
+    df = df.sort_values("draw_date").reset_index(drop=True)
+    return df
+
+
+def get_lottery_columns(df: pd.DataFrame) -> list:
+    """
+    Detect known lottery columns (DR, FB, SG, GZ, GL, GB).
+    Returns the *actual* column names as they appear in df.
+    """
+    KNOWN = {"DR", "FB", "SG", "GZ", "GL", "GB"}
+    found = []
+    for col in df.columns:
+        if col.strip().upper() in KNOWN:
+            found.append(col)
+    return found
+
+
+def compute_streak(values: pd.Series) -> pd.Series:
+    """
+    Compute consecutive-ones streak for a 0/1 Series.
+    Example: [0,1,1,0,1] -> [0,1,2,0,1]
+    """
+    streak = []
+    current = 0
+    for v in values.fillna(0).astype(int):
+        if v == 1:
+            current += 1
+        else:
+            current = 0
+        streak.append(current)
+    return pd.Series(streak, index=values.index)
+
+
+def prepare_lottery_dataset_for_parity_range(
+    df_raw: pd.DataFrame,
+    lottery_col: str,
+) -> tuple[pd.DataFrame, list]:
+    """
+    From the full raw df + chosen lottery column, build:
+    - clean 'draw_date'
+    - numeric lottery column ('lottery_value') 0-99
+    - targets:
+        * target_parity: 0 = even, 1 = odd
+        * target_range:  0 = low (0-49), 1 = high (50-99)
+        * target_4class: 0..3 as:
+            0: Even & Low  (0-49 even)
+            1: Odd  & Low  (0-49 odd)
+            2: Even & High (50-99 even)
+            3: Odd  & High (50-99 odd)
+    - leak-free features based ONLY on PAST draws:
+        * rolling odd/high ratios
+        * previous odd/high flag
+        * previous odd/high streaks
+        * calendar features
+    Returns:
+        df_feat, feature_cols
+    """
+    # Standardize date column
+    df = ensure_draw_date_column(df_raw)
+
+    if lottery_col not in df.columns:
+        raise KeyError(f"Lottery column '{lottery_col}' not found in CSV.")
+
+    # Clean numeric lottery values (0-99)
+    lot = pd.to_numeric(df[lottery_col], errors="coerce")
+    df = df.loc[lot.notna()].copy()
+    df["lottery_value"] = lot.loc[df.index].astype(int)
+
+    # Sort strictly by date again (after filtering)
+    df = df.sort_values("draw_date").reset_index(drop=True)
+
+    # ---------- Targets ---------- #
+    parity = (df["lottery_value"] % 2).astype(int)       # 0 even, 1 odd
+    high   = (df["lottery_value"] >= 50).astype(int)     # 0 low, 1 high
+
+    df["target_parity"] = parity
+    df["target_range"]  = high
+    # Combine into 4 classes:
+    # class = parity + 2*high
+    # 0: even+low, 1: odd+low, 2: even+high, 3: odd+high
+    df["target_4class"] = parity + 2 * high
+
+    # ---------- Leak-free historical features ---------- #
+    # Use only PAST info via shift(1).
+
+    # Past odd / high flags
+    odd_prev  = parity.shift(1).fillna(0).astype(int)
+    high_prev = high.shift(1).fillna(0).astype(int)
+
+    df["feat_odd_prev"]  = odd_prev
+    df["feat_high_prev"] = high_prev
+
+    # Rolling ratios of odd/high over windows of 5, 10, 20, 50 past draws
+    windows = [5, 10, 20, 50]
+    for w in windows:
+        df[f"feat_odd_ratio_{w}"] = (
+            parity.shift(1).rolling(window=w, min_periods=1).mean()
+        )
+        df[f"feat_high_ratio_{w}"] = (
+            high.shift(1).rolling(window=w, min_periods=1).mean()
+        )
+
+    # Streaks of past odds/high numbers (in draws, not days)
+    df["feat_odd_streak_prev"]  = compute_streak(odd_prev)
+    df["feat_high_streak_prev"] = compute_streak(high_prev)
+
+    # ---------- Calendar features ---------- #
+    dt = df["draw_date"]
+    df["feat_year"]           = dt.dt.year
+    df["feat_month"]          = dt.dt.month
+    df["feat_day"]            = dt.dt.day
+    df["feat_dow"]            = dt.dt.weekday  # 0=Mon,6=Sun
+    df["feat_is_month_start"] = dt.dt.is_month_start.astype(int)
+    df["feat_is_month_end"]   = dt.dt.is_month_end.astype(int)
+
+    # Collect all feature columns
+    feature_cols = [c for c in df.columns if c.startswith("feat_")]
+
+    return df, feature_cols
+
+
+def chrono_train_test_split(df: pd.DataFrame, train_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Chronological split: first 'train_ratio' fraction for training,
+    remaining for test. Assumes df already sorted by draw_date.
+    """
+    n = len(df)
+    if n < 50:
+        raise ValueError(f"Not enough rows after cleaning for a stable split (got {n}, need ~50+).")
+
+    split_idx = int(n * train_ratio)
+    if split_idx <= 10 or n - split_idx <= 10:
+        raise ValueError(
+            f"Train/test split too extreme for dataset size {n}. "
+            f"Try a train ratio between 0.6 and 0.9."
+        )
+
+    train_df = df.iloc[:split_idx].copy()
+    test_df  = df.iloc[split_idx:].copy()
+    return train_df, test_df
+
+
+def compute_binary_metrics(y_true, prob_1) -> dict:
+    """
+    For binary tasks:
+    y_true: array-like of 0/1
+    prob_1: predicted probability of class 1
+    """
+    y_true = np.asarray(y_true).astype(int)
+    prob_1 = np.asarray(prob_1).astype(float)
+    pred = (prob_1 >= 0.5).astype(int)
+
+    acc = float((pred == y_true).mean())
+    # Brier score
+    brier = float(np.mean((prob_1 - y_true) ** 2))
+    # Simple logloss
+    eps = 1e-15
+    logloss = float(
+        -np.mean(y_true * np.log(prob_1 + eps) + (1 - y_true) * np.log(1 - prob_1 + eps))
+    )
+    return {"accuracy": acc, "brier": brier, "logloss": logloss}
+
+
+def compute_multiclass_metrics(y_true, prob_matrix) -> dict:
+    """
+    For 4-class task:
+    y_true: array-like of ints in {0,1,2,3}
+    prob_matrix: shape (n_samples, 4)
+    """
+    y_true = np.asarray(y_true).astype(int)
+    prob_matrix = np.asarray(prob_matrix).astype(float)
+    pred = np.argmax(prob_matrix, axis=1)
+
+    acc = float((pred == y_true).mean())
+    eps = 1e-15
+    # logloss = -mean(log p_true)
+    true_probs = prob_matrix[np.arange(len(y_true)), y_true]
+    logloss = float(-np.mean(np.log(true_probs + eps)))
+    return {"accuracy": acc, "logloss": logloss}
+
+
+FOUR_CLASS_LABELS = {
+    0: "Even & Low (0–49 even)",
+    1: "Odd & Low (0–49 odd)",
+    2: "Even & High (50–99 even)",
+    3: "Odd & High (50–99 odd)",
+}
+
+# ---------- Streamlit UI: New Section + Tabs ---------- #
+
+st.markdown("---")
+st.subheader("Parity / Range Prediction (per lottery) – Strategy B & C")
+
+uploaded_cls = st.file_uploader(
+    "Upload CSV for Parity/Range models (same lottery CSV as elsewhere)",
+    type=["csv"],
+    key="csv_parity_range",
+)
+
+if uploaded_cls is None:
+    st.info("Upload a CSV file here to use the Odd/Even & Low/High models.")
+else:
+    try:
+        df_cls_raw = load_csv_robust_for_classifiers(uploaded_cls)
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        df_cls_raw = None
+
+    if df_cls_raw is not None:
+        # Detect available lotteries
+        lottery_cols = get_lottery_columns(df_cls_raw)
+        if not lottery_cols:
+            st.error(
+                "Could not find any lottery columns (DR, FB, SG, GZ, GL, GB) "
+                "in the uploaded CSV. Please check your headers."
+            )
+        else:
+            st.success(f"Detected lottery columns: {', '.join(lottery_cols)}")
+
+            # Global controls for both tabs
+            chosen_lottery = st.selectbox(
+                "Choose lottery column",
+                options=lottery_cols,
+                index=0,
+                help="Models will be trained ONLY for this lottery (per-lottery, not ensemble).",
+            )
+
+            train_ratio = st.slider(
+                "Train fraction (chronological split)",
+                min_value=0.6,
+                max_value=0.9,
+                value=0.7,
+                step=0.05,
+                help="First fraction of rows (by date) used for training; remaining for test.",
+            )
+
+            if not CATBOOST_AVAILABLE:
+                st.error(
+                    "CatBoost is not available in this environment. "
+                    "Run `pip install catboost` and restart the app to use these models."
+                )
+            else:
+                # Prepare dataset once; reuse in both tabs.
+                try:
+                    df_cls, feat_cols = prepare_lottery_dataset_for_parity_range(
+                        df_cls_raw, chosen_lottery
+                    )
+                except Exception as e:
+                    st.error(f"Error preparing dataset for '{chosen_lottery}': {e}")
+                    df_cls = None
+
+                if df_cls is not None:
+                    tab_bin, tab_four = st.tabs(
+                        [
+                            "Binary Parity & Range (Strategy B)",
+                            "4-Class Parity+Range (Strategy C)",
+                        ]
+                    )
+
+                    # ====== TAB 1: Strategy B – Two Binary Classifiers ====== #
+                    with tab_bin:
+                        st.markdown("### Strategy B – Dedicated Binary Classifiers")
+                        st.write(
+                            "Trains two separate CatBoost models, **per lottery**:\n"
+                            "- Odd (1) vs Even (0)\n"
+                            "- High (1, 50–99) vs Low (0, 0–49)\n"
+                            "All features are based only on *past* draws for this lottery."
+                        )
+
+                        if st.button(
+                            f"Train & Evaluate Binary Models for {chosen_lottery}",
+                            key="btn_train_binary_parity_range",
+                        ):
+                            try:
+                                train_df, test_df = chrono_train_test_split(df_cls, train_ratio)
+
+                                X_train = train_df[feat_cols]
+                                X_test  = test_df[feat_cols]
+
+                                # ----- Parity model ----- #
+                                y_parity_train = train_df["target_parity"]
+                                y_parity_test  = test_df["target_parity"]
+
+                                model_parity = CatBoostClassifier(
+                                    loss_function="Logloss",
+                                    depth=6,
+                                    learning_rate=0.05,
+                                    n_estimators=300,
+                                    random_seed=42,
+                                    verbose=False,
+                                )
+                                model_parity.fit(X_train, y_parity_train, verbose=False)
+                                prob_parity_test = model_parity.predict_proba(X_test)[:, 1]
+                                metrics_parity = compute_binary_metrics(
+                                    y_parity_test, prob_parity_test
+                                )
+
+                                # ----- Range model ----- #
+                                y_range_train = train_df["target_range"]
+                                y_range_test  = test_df["target_range"]
+
+                                model_range = CatBoostClassifier(
+                                    loss_function="Logloss",
+                                    depth=6,
+                                    learning_rate=0.05,
+                                    n_estimators=300,
+                                    random_seed=43,
+                                    verbose=False,
+                                )
+                                model_range.fit(X_train, y_range_train, verbose=False)
+                                prob_range_test = model_range.predict_proba(X_test)[:, 1]
+                                metrics_range = compute_binary_metrics(
+                                    y_range_test, prob_range_test
+                                )
+
+                                st.markdown("#### Results – Parity (Odd vs Even)")
+                                st.write(
+                                    f"**Accuracy**: {metrics_parity['accuracy']:.3f}  \n"
+                                    f"**Brier score**: {metrics_parity['brier']:.4f}  \n"
+                                    f"**Logloss**: {metrics_parity['logloss']:.4f}"
+                                )
+
+                                # Small parity confusion matrix
+                                y_par_pred = (prob_parity_test >= 0.5).astype(int)
+                                cm_par = pd.crosstab(
+                                    pd.Series(y_parity_test, name="Actual"),
+                                    pd.Series(y_par_pred, name="Predicted"),
+                                )
+                                st.write("Confusion matrix – Parity:")
+                                st.dataframe(cm_par)
+
+                                st.markdown("---")
+                                st.markdown("#### Results – Range (0–49 Low vs 50–99 High)")
+                                st.write(
+                                    f"**Accuracy**: {metrics_range['accuracy']:.3f}  \n"
+                                    f"**Brier score**: {metrics_range['brier']:.4f}  \n"
+                                    f"**Logloss**: {metrics_range['logloss']:.4f}"
+                                )
+
+                                y_rng_pred = (prob_range_test >= 0.5).astype(int)
+                                cm_rng = pd.crosstab(
+                                    pd.Series(y_range_test, name="Actual"),
+                                    pd.Series(y_rng_pred, name="Predicted"),
+                                )
+                                st.write("Confusion matrix – Range:")
+                                st.dataframe(cm_rng)
+
+                                # Show last few test rows with predictions for inspection
+                                st.markdown("#### Sample of test rows with predictions")
+                                sample_show = test_df[["draw_date", "lottery_value"]].copy()
+                                sample_show["Actual Parity (0=Even,1=Odd)"] = y_parity_test.values
+                                sample_show["Pred P(odd)"] = np.round(prob_parity_test, 3)
+                                sample_show["Actual Range (0=0–49,1=50–99)"] = y_range_test.values
+                                sample_show["Pred P(high 50–99)"] = np.round(prob_range_test, 3)
+                                st.dataframe(sample_show.tail(20))
+
+                            except Exception as e:
+                                st.error(f"Error training/evaluating binary models: {e}")
+
+                    # ====== TAB 2: Strategy C – Single 4-Class Model ====== #
+                    with tab_four:
+                        st.markdown("### Strategy C – Single 4-Class Model")
+                        st.write(
+                            "Trains one **multi-class CatBoost** model (per lottery) with 4 classes:\n"
+                            "- 0: Even & Low (0–49 even)\n"
+                            "- 1: Odd & Low (0–49 odd)\n"
+                            "- 2: Even & High (50–99 even)\n"
+                            "- 3: Odd & High (50–99 odd)\n\n"
+                            "You can recover Odd/Even or Low/High probabilities by summing relevant class probabilities."
+                        )
+
+                        if st.button(
+                            f"Train & Evaluate 4-Class Model for {chosen_lottery}",
+                            key="btn_train_4class_parity_range",
+                        ):
+                            try:
+                                train_df, test_df = chrono_train_test_split(df_cls, train_ratio)
+
+                                X_train = train_df[feat_cols]
+                                X_test  = test_df[feat_cols]
+                                y4_train = train_df["target_4class"]
+                                y4_test  = test_df["target_4class"]
+
+                                model4 = CatBoostClassifier(
+                                    loss_function="MultiClass",
+                                    depth=6,
+                                    learning_rate=0.05,
+                                    n_estimators=350,
+                                    random_seed=44,
+                                    verbose=False,
+                                )
+                                model4.fit(X_train, y4_train, verbose=False)
+                                prob4_test = model4.predict_proba(X_test)
+                                metrics4 = compute_multiclass_metrics(y4_test, prob4_test)
+
+                                st.markdown("#### Results – 4-Class Parity+Range")
+                                st.write(
+                                    f"**Accuracy**: {metrics4['accuracy']:.3f}  \n"
+                                    f"**Logloss**: {metrics4['logloss']:.4f}"
+                                )
+
+                                # Map numeric labels to text for confusion matrix
+                                y4_pred = np.argmax(prob4_test, axis=1)
+
+                                actual_labels = pd.Series(
+                                    [FOUR_CLASS_LABELS[int(v)] for v in y4_test],
+                                    name="Actual",
+                                )
+                                pred_labels = pd.Series(
+                                    [FOUR_CLASS_LABELS[int(v)] for v in y4_pred],
+                                    name="Predicted",
+                                )
+                                cm4 = pd.crosstab(actual_labels, pred_labels)
+                                st.write("Confusion matrix – 4 classes:")
+                                st.dataframe(cm4)
+
+                                # Show sample of test rows with probabilities
+                                st.markdown("#### Sample of test rows with 4-class probabilities")
+                                sample = test_df[["draw_date", "lottery_value"]].copy()
+                                for cls in range(4):
+                                    sample[f"P({cls}: {FOUR_CLASS_LABELS[cls]})"] = np.round(
+                                        prob4_test[:, cls], 3
+                                    )
+                                st.dataframe(sample.tail(20))
+
+                            except Exception as e:
+                                st.error(f"Error training/evaluating 4-class model: {e}")
+
 
