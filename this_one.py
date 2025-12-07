@@ -1984,6 +1984,7 @@ with tab3:
                             file_name="ensemble_backtest_details_combined_walkforward.csv",
                             mime="text/csv",
                         )
+
 # ============================================================
 # Parity / Range Models (Strategy B & Strategy C, per lottery)
 # ============================================================
@@ -2432,7 +2433,6 @@ def build_next_feature_row(
         feat[f"feat_high_ratio_{w}"] = float(high[start_idx:n].mean())
 
     # Streaks: use existing streaks to extend
-    # streak_prev at last row counts streak in parity up to index n-2; so extend by last_parity
     last_odd_streak_prev  = int(df_sorted["feat_odd_streak_prev"].iloc[-1])
     last_high_streak_prev = int(df_sorted["feat_high_streak_prev"].iloc[-1])
 
